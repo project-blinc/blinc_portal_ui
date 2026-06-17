@@ -1,49 +1,40 @@
 # blinc_portal_ui
 
-Immediate-mode widget toolkit for canvas closures. Lets you render
-real interactive widgets and free-form painting INSIDE a
-[`blinc_canvas_kit::CanvasKit`] element — typically a node body in
-[`blinc_node_editor`], a tool palette in a custom canvas-kit app, or
-any other region of a canvas closure that wants to host an inline
-mini UI.
+Immediate-mode widgets for canvas closures. Renders interactive
+widgets and free-form paint inside a
+[`blinc_canvas_kit::CanvasKit`] element: node bodies in
+[`blinc_node_editor`], tool palettes, in-canvas mini UIs.
 
-## Why imgui (and not retained mode)
+## Imgui, not retained mode
 
-Canvas closures already run every frame — the `had_canvas_painted`
-cache-bust gate means the canvas's interior isn't cached frame-to-
-frame. That makes imgui's "re-emit every frame" rhythm a perfect
-fit: no offscreen texture to manage, no retained tree to diff
-against, no second event router to keep in sync with the host. The
-portal's widget calls are pure draw + pure hit-region registration,
-and the kit you're already using does both.
+Canvas closures re-run every frame. `had_canvas_painted` already
+cache-busts the canvas interior, so an imgui rhythm (re-emit every
+frame) drops in cleanly: no offscreen texture, no diffable tree, no
+second event router. Widget calls are `draw + hit_rect`; the kit
+provides both.
 
-## State model
+## State
 
-Two categories, kept distinct:
+Two layers:
 
-1. **Widget-local interaction state** — slider drag offset, text
-   input cursor, hover ease t. Lives in `PortalStorage`, a
-   `HashMap<WidgetId, Box<dyn Any>>` the portal owns. `WidgetId` is
-   a hash chain through the portal id + the id stack at the call
-   site + an optional caller key, so issuing the same widget
-   sequence frame-to-frame produces stable ids. Entries that no
-   widget touched this frame are dropped at frame end.
-
-2. **Semantic state** — the values widgets edit. Use Blinc
+1. **Widget-local** (slider drag offset, hover ease, cursor) lives
+   in `PortalStorage`, a `HashMap<WidgetId, Box<dyn Any>>`.
+   `WidgetId` hashes the portal id + the id stack at the call site
+   + an optional caller key, so re-emitting the same call sequence
+   produces stable ids. Untouched entries drop at frame end.
+2. **Semantic** (the values widgets edit) lives in
    [`Signal<T>`](blinc_core::reactive::Signal). Every built-in
-   widget exposes a `_signal` form that reads the signal at frame
-   time, auto-subscribes the portal to it via the reactive read
-   tracker, and writes back on user edits. Signal mutations from
-   ANYWHERE (FSM transitions, animations, async tasks, retained-
-   mode `cn::input` bound to the same signal) flip the portal's
-   dirty flag and the host's next composite repaints.
+   widget has a `_signal` form that reads + auto-subscribes via
+   the reactive tracker and writes on edit. Mutations from outside
+   the portal (FSM, animation, retained-mode `cn::input` on the
+   same signal) flip the portal dirty bit and the next composite
+   repaints.
 
-## The frame contract
+## Frame contract
 
-Inside your canvas closure:
+Inside the canvas closure:
 
 ```rust
-// Once per portal-per-frame:
 portal.frame(ctx, &kit, body_rect, &PortalStyle::from_active_theme(), &host_bridge,
     |ui| {
         ui.label("Threshold");
@@ -53,14 +44,13 @@ portal.frame(ctx, &kit, body_rect, &PortalStyle::from_active_theme(), &host_brid
         }
         ui.label_signal(&display_pct);
 
-        // Free-form painting — sparklines, sketches, custom viz.
         let (mut p, _) = ui.allocate_painter((180.0, 32.0), Sense::Hover);
         draw_sparkline(&mut p, &history.get());
     });
 ```
 
-Before any portal renders, install the click-recorder hook ONCE on
-the kit so widget `Response::clicked` works:
+Install the click-recorder hook once per kit so `Response::clicked`
+fires:
 
 ```rust
 let mut kit = CanvasKit::new("graph");
@@ -69,13 +59,12 @@ blinc_portal_ui::ui::install_click_hook(&mut kit);
 
 ## Overlay escape
 
-Popovers / dropdowns / tooltips opened from a portal widget should
-escape the portal and live in the host's overlay manager — they
-paint in screen space above everything, dismiss via the host's
-click-outside rules, and share z-order with overlays opened
-elsewhere in the app. The portal contributes the anchor coordinate
-(transformed from widget-local → canvas-content → screen via
-`HostBridge::canvas_to_screen`) and otherwise hands off completely.
+Popovers, dropdowns, and tooltips opened from a widget should live
+in the host overlay manager: they paint in screen space, dismiss
+via the host's click-outside rules, and share z-order with other
+overlays. The portal hands off an anchor coordinate (widget-local
+to canvas-content to screen, via `HostBridge::canvas_to_screen`)
+and does nothing else.
 
 ```rust
 if ui.button("Open").clicked {
@@ -84,9 +73,9 @@ if ui.button("Open").clicked {
 }
 ```
 
-## Free-form painting
+## Free-form paint
 
-Every widget is implemented in terms of `allocate_painter`:
+Every widget builds on `allocate_painter`:
 
 ```rust
 let (mut p, resp) = ui.allocate_painter((180.0, 120.0), Sense::Drag);
@@ -100,40 +89,40 @@ for stroke in &state.strokes {
 }
 ```
 
-Or take the whole region: `ui.allocate_painter(ui.available_size(), Sense::Drag)`.
+Use `ui.allocate_painter(ui.available_size(), Sense::Drag)` for the
+whole region.
 
 ## Built-in widgets
 
 `label`, `label_signal`, `button`, `slider`, `slider_signal`,
-`switch`, `switch_signal`, `text_input`, `text_input_signal`, plus
+`switch`, `switch_signal`, `text_input`, `text_input_signal`,
 `spacing`, `horizontal`, `push_id`.
 
-Custom widgets are a one-liner over `allocate_painter`:
+Custom widgets are one-liners over `allocate_painter`:
 
 ```rust
 fn star_button(ui: &mut PortalUi, rating: u8) -> u8 {
     let (mut p, resp) = ui.allocate_painter((100.0, 24.0), Sense::Click);
-    // ... paint stars, return updated rating
+    // paint stars, return updated rating
     rating
 }
 ```
 
-## Things that aren't built yet
+## Not yet built
 
-- Text input is read-only display in v0.1 (canvas-kit doesn't have
-  a typed-character dispatch path yet). Click-to-open-overlay is
-  the workaround.
-- No flexbox; the layout combinators are vertical / horizontal
-  stack + indent. Node bodies don't need more.
-- No focus traversal (Tab key). When canvas-kit grows keyboard
-  routing, focus handling lands here too.
+- Text input renders as read-only display until canvas-kit
+  surfaces a typed-character dispatch path. Click-to-open-overlay
+  is the workaround.
+- No flexbox. Layout combinators are vertical / horizontal stack +
+  indent.
+- No focus traversal (Tab). Lands when canvas-kit grows keyboard
+  routing.
 
-## Crate layout
+## Modules
 
-- `core` — `PortalId`, `WidgetId`, `Response`, `Sense`,
+- `core`: `PortalId`, `WidgetId`, `Response`, `Sense`,
   `PortalStorage`, `PortalStyle`, `HostBridge`.
-- `painter` — `PortalPainter`.
-- `signal` — `PortalSubscriptions` + the global notifier installer.
-- `ui` — `Portal`, `PortalUi`, `install_click_hook`.
-- `widget` — built-in widget impls (all live as inherent methods on
-  `PortalUi`).
+- `painter`: `PortalPainter`.
+- `signal`: `PortalSubscriptions` + global notifier installer.
+- `ui`: `Portal`, `PortalUi`, `install_click_hook`.
+- `widget`: built-in widget impls (inherent methods on `PortalUi`).

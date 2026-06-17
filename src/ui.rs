@@ -154,6 +154,7 @@ impl Portal {
     /// Returns true if any widget is mid-animation or any read
     /// signal fired this frame — the host should request another
     /// paint when true.
+    #[allow(clippy::too_many_arguments)] // 8 args are intrinsic to the frame contract.
     pub fn frame<F>(
         &mut self,
         ctx: &mut dyn DrawContext,
