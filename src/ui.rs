@@ -1006,6 +1006,38 @@ mod tests {
     }
 
     #[test]
+    fn portal_new_starts_clean() {
+        let p = Portal::new("test_node");
+        assert!(!p.is_dirty(), "fresh portal is not dirty");
+        assert_eq!(
+            p.consumed_height(),
+            0.0,
+            "fresh portal reports zero consumed height"
+        );
+    }
+
+    #[test]
+    fn portal_mark_dirty_flips_flag() {
+        let p = Portal::new("dirty_test");
+        assert!(!p.is_dirty());
+        p.mark_dirty();
+        assert!(p.is_dirty(), "mark_dirty flips is_dirty");
+    }
+
+    #[test]
+    fn portal_id_is_stable_per_key() {
+        let a1 = Portal::new("stable_id_test").id();
+        let a2 = Portal::new("stable_id_test").id();
+        assert_eq!(
+            a1, a2,
+            "same host key → same portal id across constructions"
+        );
+        let b = Portal::new("different_key").id();
+        assert_ne!(a1, b, "different host keys → distinct portal ids");
+    }
+
+
+    #[test]
     fn portal_manager_retain_drops_missing_keys() {
         let mut mgr = PortalManager::<i32>::new();
         let _ = mgr.get_or_make(1);

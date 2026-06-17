@@ -469,4 +469,58 @@ mod tests {
             (10.0, 20.0, 30.0, 40.0)
         );
     }
+
+    #[test]
+    fn host_bridge_from_closures_round_trips_through_caller_transform() {
+        // Translate canvas → screen by (+100, +200); inverse subtracts.
+        let b = HostBridge::from_closures(
+            |p| Point::new(p.x + 100.0, p.y + 200.0),
+            |p| Point::new(p.x - 100.0, p.y - 200.0),
+        );
+        let r = Rect::new(10.0, 20.0, 30.0, 40.0);
+        let s = b.rect_to_screen(r);
+        assert_eq!(
+            (s.x(), s.y(), s.width(), s.height()),
+            (110.0, 220.0, 30.0, 40.0),
+            "rect_to_screen applies canvas_to_screen to both corners"
+        );
+        let p = (b.screen_to_canvas)(Point::new(110.0, 220.0));
+        assert_eq!((p.x, p.y), (10.0, 20.0), "screen_to_canvas inverts");
+    }
+
+    #[test]
+    fn sense_default_is_none() {
+        // Per-axis default for the `Sense` builder slot — paint-only
+        // regions should not register a hit region. Default<Sense>
+        // is what `allocate_painter(size, Sense::default())` lands on.
+        assert_eq!(Sense::default(), Sense::None);
+    }
+
+    #[test]
+    fn response_chainable_builder_overrides_each_field() {
+        let r = Response::empty()
+            .with_rect(Rect::new(5.0, 6.0, 7.0, 8.0))
+            .with_clicked(true)
+            .with_changed(true)
+            .with_animating(true);
+        assert_eq!(
+            (r.rect.x(), r.rect.y(), r.rect.width(), r.rect.height()),
+            (5.0, 6.0, 7.0, 8.0)
+        );
+        assert!(r.clicked);
+        assert!(r.changed);
+        assert!(r.animating);
+        // Untouched fields stay at empty()'s defaults.
+        assert!(!r.hovered);
+        assert!(!r.pressed);
+    }
+
+    #[test]
+    fn portal_id_from_hashed_is_deterministic() {
+        let a = PortalId::from_hashed("stable_input");
+        let b = PortalId::from_hashed("stable_input");
+        assert_eq!(a, b, "same input → same id");
+        let c = PortalId::from_hashed("different_input");
+        assert_ne!(a, c, "different input → different id");
+    }
 }
