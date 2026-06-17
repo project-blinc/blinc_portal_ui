@@ -25,4 +25,6 @@ pub use crate::core::{
 };
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;
-pub use crate::ui::{install_click_hook, LayoutDirection, Portal, PortalManager, PortalUi};
+pub use crate::ui::{
+    install_click_hook, FrameOutcome, LayoutDirection, Portal, PortalFrame, PortalManager, PortalUi,
+};

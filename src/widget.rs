@@ -78,12 +78,20 @@ impl<'a> PortalUi<'a> {
     /// changes from anywhere. Reading the signal inside the
     /// portal's render closure registers the portal as a subscriber
     /// for the rest of the frame.
-    pub fn label_signal<T: Clone + std::fmt::Display + Send + 'static + Default>(
+    ///
+    /// Uses `Signal::try_get` so types without a `Default` impl
+    /// (`NonZeroU32`, non_exhaustive enums, user newtypes that lack
+    /// a meaningful zero value) work without a workaround. Signals
+    /// that don't resolve (graph rebuild mid-frame) render an empty
+    /// label rather than panic.
+    pub fn label_signal<T: Clone + std::fmt::Display + Send + 'static>(
         &mut self,
         sig: &Signal<T>,
     ) -> Response {
-        let value = sig.get();
-        self.label(&value.to_string())
+        match sig.try_get() {
+            Some(v) => self.label(&v.to_string()),
+            None => self.label(""),
+        }
     }
 }
 

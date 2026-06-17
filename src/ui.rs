@@ -347,6 +347,122 @@ impl Drop for Portal {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Portal::begin — chainable builder for frame(...)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Chainable alternative to [`Portal::frame`]: configure the frame
+/// piece by piece, then `.run(|ui| ...)` to dispatch the closure. The
+/// 7 positional arguments to `frame()` are easy to mix up; the
+/// builder form makes the wiring self-documenting.
+///
+/// Constructed via [`Portal::begin`]. `style` and `host` are required;
+/// `clip_radius` defaults to `0.0` (axis-aligned rect clip). Calling
+/// [`Self::run`] without setting `style` / `host` panics with a clear
+/// message rather than producing a runtime miscompute.
+pub struct PortalFrame<'a> {
+    portal: &'a mut Portal,
+    ctx: &'a mut dyn DrawContext,
+    kit: &'a CanvasKit,
+    bounds: Rect,
+    clip_radius: f32,
+    style: Option<&'a PortalStyle>,
+    host: Option<&'a HostBridge>,
+}
+
+impl<'a> PortalFrame<'a> {
+    /// Rounded-rect clip radius for the portal viewport. Default `0.0`
+    /// (sharp rect clip). Pass the same radius the host paints the
+    /// portal's visible background with so widget paint clips to the
+    /// exact curve.
+    pub fn clip_radius(mut self, r: f32) -> Self {
+        self.clip_radius = r;
+        self
+    }
+
+    /// Active style for the frame. Built-in widgets read colours and
+    /// metrics from this; custom widgets can ignore it. Required.
+    pub fn style(mut self, style: &'a PortalStyle) -> Self {
+        self.style = Some(style);
+        self
+    }
+
+    /// Coordinate-transform bridge for widgets that need to anchor
+    /// host-screen overlays. Pass [`HostBridge::identity`] when the
+    /// portal lives in a non-transformed canvas. Required.
+    pub fn host(mut self, host: &'a HostBridge) -> Self {
+        self.host = Some(host);
+        self
+    }
+
+    /// Dispatch the UI closure. Returns a [`FrameOutcome`] whose
+    /// `needs_redraw()` the host ORs into its repaint / animation-tick
+    /// request path. Marked `#[must_use]` on the outcome type so
+    /// dropping the result without consulting it warns.
+    pub fn run<F>(self, ui_closure: F) -> FrameOutcome
+    where
+        F: FnOnce(&mut PortalUi<'_>),
+    {
+        let style = self
+            .style
+            .expect("PortalFrame::run: missing .style(&PortalStyle)");
+        let host = self
+            .host
+            .expect("PortalFrame::run: missing .host(&HostBridge)");
+        let any = self.portal.frame(
+            self.ctx,
+            self.kit,
+            self.bounds,
+            self.clip_radius,
+            style,
+            host,
+            ui_closure,
+        );
+        FrameOutcome {
+            any_animating_or_dirty: any,
+        }
+    }
+}
+
+/// Typed return from [`PortalFrame::run`]. The host should call
+/// [`Self::needs_redraw`] and feed it into its repaint /
+/// animation-tick request path.
+#[must_use = "FrameOutcome reports whether the portal needs another paint; consult `.needs_redraw()`"]
+pub struct FrameOutcome {
+    any_animating_or_dirty: bool,
+}
+
+impl FrameOutcome {
+    /// True if any widget is mid-animation or any read signal fired
+    /// this frame — the host should request another paint when true.
+    pub fn needs_redraw(&self) -> bool {
+        self.any_animating_or_dirty
+    }
+}
+
+impl Portal {
+    /// Open a [`PortalFrame`] builder bound to `ctx` / `kit` / `bounds`.
+    /// Set `.style(...)` / `.host(...)` (and optionally `.clip_radius(...)`)
+    /// then call `.run(|ui| ...)`. Equivalent to [`Self::frame`] but
+    /// the wiring is self-documenting.
+    pub fn begin<'a>(
+        &'a mut self,
+        ctx: &'a mut dyn DrawContext,
+        kit: &'a CanvasKit,
+        bounds: Rect,
+    ) -> PortalFrame<'a> {
+        PortalFrame {
+            portal: self,
+            ctx,
+            kit,
+            bounds,
+            clip_radius: 0.0,
+            style: None,
+            host: None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // PortalUi — per-frame builder
 // ─────────────────────────────────────────────────────────────────────
 
@@ -381,7 +497,6 @@ pub struct PortalUi<'a> {
     pub(crate) storage: &'a mut PortalStorage,
     pub(crate) interaction: &'a InteractionState,
     pub(crate) last_drag_pos: &'a mut ahash::AHashMap<String, Point>,
-    #[allow(dead_code)]
     pub(crate) host: &'a HostBridge,
     pub(crate) id_stack: Vec<u64>,
     pub(crate) portal_id: PortalId,
@@ -428,6 +543,16 @@ impl<'a> PortalUi<'a> {
         self.layout
     }
 
+    /// Borrow the host's coordinate-transform bridge. Widgets that
+    /// need to anchor an overlay outside the canvas (a host-native
+    /// popover for typing, a colour picker, a tooltip) call
+    /// `ui.host().canvas_to_screen(point)` or
+    /// `ui.host().rect_to_screen(rect)` to convert their widget-local
+    /// rect into the screen-space coords the overlay manager expects.
+    pub fn host(&self) -> &HostBridge {
+        self.host
+    }
+
     /// Remaining space the next widget can grow into.
     ///
     /// - `w` is the remaining horizontal room from the cursor to the
@@ -448,10 +573,10 @@ impl<'a> PortalUi<'a> {
         let w =
             (self.bounds.x() + self.bounds.width() - self.cursor.x - self.style.spacing).max(0.0);
         let h = match self.layout {
-            LayoutDirection::Vertical => (self.bounds.y() + self.bounds.height()
-                - self.cursor.y
-                - self.style.spacing)
-                .max(0.0),
+            LayoutDirection::Vertical => {
+                (self.bounds.y() + self.bounds.height() - self.cursor.y - self.style.spacing)
+                    .max(0.0)
+            }
             LayoutDirection::Horizontal => self.style.control_height,
         };
         (w, h)
