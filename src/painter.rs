@@ -2,9 +2,9 @@
 //! Free-form draw + style-aware helpers. See `README.md`.
 
 use crate::core::{ctrl_radius, PortalStyle, Response};
+use blinc_core::draw::{Path, Stroke, TextStyle};
 use blinc_core::layer::{Brush, CornerRadius, Point, Rect};
 use blinc_core::{DrawContext, FontWeight, TextAlign, TextBaseline};
-use blinc_core::draw::{Path, Stroke, TextStyle};
 
 /// Drawable region scoped to a rect reserved via
 /// [`crate::PortalUi::allocate_painter`].
@@ -101,12 +101,19 @@ impl<'a> PortalPainter<'a> {
 
     /// Stroked rounded rect at the painter's full bounds.
     pub fn stroke_self(&mut self, style: &PortalStyle, stroke: &Stroke, brush: Brush) {
-        self.ctx.stroke_rect(self.rect, ctrl_radius(style), stroke, brush);
+        self.ctx
+            .stroke_rect(self.rect, ctrl_radius(style), stroke, brush);
     }
 
     /// Plain-text glyph stroke at the given origin in
     /// canvas-content coords, using the style's text colour + font.
-    pub fn text(&mut self, text: &str, origin: Point, style: &PortalStyle, color: blinc_core::layer::Color) {
+    pub fn text(
+        &mut self,
+        text: &str,
+        origin: Point,
+        style: &PortalStyle,
+        color: blinc_core::layer::Color,
+    ) {
         let s = TextStyle {
             family: "system-ui".to_string(),
             size: style.font_size,

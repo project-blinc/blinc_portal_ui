@@ -127,8 +127,12 @@ impl Response {
 ///   release inside the rect.
 /// - `Drag` — same as `Click` plus `Response::drag_delta_local`
 ///   reports per-frame movement while pressed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Sense {
+    /// Paint-only: no hit region is registered. Default for decorative
+    /// fills, dividers, and any painter the caller doesn't need a
+    /// response from.
+    #[default]
     None,
     Hover,
     Click,
@@ -302,7 +306,12 @@ impl PortalStyle {
 }
 
 fn darken(c: Color, t: f32) -> Color {
-    Color::rgba((c.r * (1.0 - t)).max(0.0), (c.g * (1.0 - t)).max(0.0), (c.b * (1.0 - t)).max(0.0), c.a)
+    Color::rgba(
+        (c.r * (1.0 - t)).max(0.0),
+        (c.g * (1.0 - t)).max(0.0),
+        (c.b * (1.0 - t)).max(0.0),
+        c.a,
+    )
 }
 
 /// Round-rect convenience — every widget paints into a corner-radius
@@ -394,6 +403,9 @@ mod tests {
         let b = HostBridge::identity();
         let r = Rect::new(10.0, 20.0, 30.0, 40.0);
         let s = b.rect_to_screen(r);
-        assert_eq!((s.x(), s.y(), s.width(), s.height()), (10.0, 20.0, 30.0, 40.0));
+        assert_eq!(
+            (s.x(), s.y(), s.width(), s.height()),
+            (10.0, 20.0, 30.0, 40.0)
+        );
     }
 }

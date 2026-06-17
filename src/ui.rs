@@ -135,7 +135,9 @@ impl Portal {
     /// Manually flag the portal as needing a repaint — useful for
     /// animations driven outside the signal system.
     pub fn mark_dirty(&self) {
-        self.subs.dirty_flag().store(true, std::sync::atomic::Ordering::Release);
+        self.subs
+            .dirty_flag()
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Run a single frame's UI closure. Call inside the canvas
@@ -153,8 +155,11 @@ impl Portal {
     ///
     /// Returns true if any widget is mid-animation or any read
     /// signal fired this frame — the host should request another
-    /// paint when true.
+    /// paint when true. The host is expected to feed this into its
+    /// own redraw / animation-tick request path; dropping the result
+    /// silently is almost always a bug, hence `#[must_use]`.
     #[allow(clippy::too_many_arguments)] // 8 args are intrinsic to the frame contract.
+    #[must_use = "Portal::frame returns whether the closure needs another paint; the host should OR this into its redraw / animation_tick request"]
     pub fn frame<F>(
         &mut self,
         ctx: &mut dyn DrawContext,
@@ -233,11 +238,23 @@ impl Portal {
         let consumed = (final_cursor_y.get() - bounds.y() + style.spacing).max(0.0);
         let prev = self.last_consumed_height;
         self.last_consumed_height = consumed;
-        // Flag dirty when the closure's footprint changes so the
-        // host's next frame re-grows the slot to fit — even when
-        // nothing else (signal / animation) would otherwise have
-        // requested a repaint.
-        if (consumed - prev).abs() > 0.5 {
+        // Asymmetric feedback gate to keep the slot from pumping a
+        // dirty flag every frame on animating children.
+        //
+        // - Grow: fire immediately — a closure that expanded between
+        //   frames is being clipped right now, so the host needs the
+        //   next frame at full size.
+        // - Shrink: only fire when nothing is mid-animation. Springy
+        //   widgets (press scale, hover ease) ripple consumed_height
+        //   downward by sub-pixel amounts every frame while settling;
+        //   the animating set already keeps the host repainting, so a
+        //   second dirty hint just doubles the wake rate. Once the
+        //   animations settle (any_animating goes false) the shrink
+        //   fires once to re-tighten the slot.
+        let dh = consumed - prev;
+        let grew = dh > 0.5;
+        let shrank_idle = dh < -0.5 && !any_animating;
+        if grew || shrank_idle {
             self.mark_dirty();
         }
 
@@ -364,8 +381,10 @@ impl<'a> PortalUi<'a> {
     /// Remaining space inside the portal's bounds, measured from the
     /// cursor in the layout's primary direction.
     pub fn available_size(&self) -> (f32, f32) {
-        let w = (self.bounds.x() + self.bounds.width() - self.cursor.x - self.style.spacing).max(0.0);
-        let h = (self.bounds.y() + self.bounds.height() - self.cursor.y - self.style.spacing).max(0.0);
+        let w =
+            (self.bounds.x() + self.bounds.width() - self.cursor.x - self.style.spacing).max(0.0);
+        let h =
+            (self.bounds.y() + self.bounds.height() - self.cursor.y - self.style.spacing).max(0.0);
         (w, h)
     }
 
@@ -423,8 +442,22 @@ impl<'a> PortalUi<'a> {
     /// rect's primary-axis dimension + `style.spacing`; in
     /// horizontal layouts the row's tallest widget governs the
     /// parent's eventual vertical advance.
-    pub fn allocate_painter(&mut self, size: (f32, f32), sense: Sense) -> (PortalPainter<'_>, Response) {
+    pub fn allocate_painter(
+        &mut self,
+        size: (f32, f32),
+        sense: Sense,
+    ) -> (PortalPainter<'_>, Response) {
         self.allocate_painter_with_key(size, sense, None)
+    }
+
+    /// Reserve a rect of `size` at the cursor and return ONLY the
+    /// painter — for decorative fills, separators, and anything else
+    /// that doesn't need a hit region. Equivalent to
+    /// `allocate_painter(size, Sense::None).0` but skips the response
+    /// build entirely and saves the caller a discarded `_` binding.
+    /// The cursor advances the same way as [`Self::allocate_painter`].
+    pub fn allocate_paint(&mut self, size: (f32, f32)) -> PortalPainter<'_> {
+        self.allocate_painter(size, Sense::None).0
     }
 
     /// `allocate_painter` with an explicit caller key. Useful when

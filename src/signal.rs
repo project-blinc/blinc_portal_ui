@@ -131,7 +131,10 @@ impl PortalSubscriptions {
         }
         // Add subscriptions for newly-read signals.
         for sig in new.difference(&old) {
-            reg.by_signal.entry(*sig).or_default().insert(self.portal_id);
+            reg.by_signal
+                .entry(*sig)
+                .or_default()
+                .insert(self.portal_id);
         }
         reg.by_portal.insert(self.portal_id, new);
     }

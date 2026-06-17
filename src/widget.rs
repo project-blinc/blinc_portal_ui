@@ -137,7 +137,11 @@ impl<'a> PortalUi<'a> {
             p.rect().x() + thumb_r + 2.0
         };
         let thumb_cy = p.rect().y() + p.rect().height() * 0.5;
-        p.fill_circle(Point::new(thumb_cx, thumb_cy), thumb_r, Brush::Solid(style.thumb));
+        p.fill_circle(
+            Point::new(thumb_cx, thumb_cy),
+            thumb_r,
+            Brush::Solid(style.thumb),
+        );
 
         resp
     }
@@ -210,7 +214,11 @@ impl<'a> PortalUi<'a> {
         let thumb_cx = track_rect.x() + track_rect.width() * t;
         let thumb_cy = track_rect.y() + track_rect.height() * 0.5;
         let thumb_r = if resp.pressed { 8.0 } else { 7.0 };
-        p.fill_circle(Point::new(thumb_cx, thumb_cy), thumb_r, Brush::Solid(style.thumb));
+        p.fill_circle(
+            Point::new(thumb_cx, thumb_cy),
+            thumb_r,
+            Brush::Solid(style.thumb),
+        );
 
         resp
     }
@@ -250,7 +258,11 @@ impl<'a> PortalUi<'a> {
 
         // Field background + border.
         let bg = style.field_bg;
-        let border = if resp.hovered { style.field_border_focus } else { style.field_border };
+        let border = if resp.hovered {
+            style.field_border_focus
+        } else {
+            style.field_border
+        };
         p.fill_self(&style, Brush::Solid(bg));
         p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
 
