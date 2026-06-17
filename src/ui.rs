@@ -690,27 +690,25 @@ impl<'a> PortalUi<'a> {
                 self.kit.hit_rect(region_id.clone(), rect);
                 let hovered = self.interaction.hovered.as_deref() == Some(region_id.as_str());
                 let active = self.interaction.active.as_deref() == Some(region_id.as_str());
-                let pointer_world = if active {
-                    // Pressed: use the kit's drag_start so the widget
-                    // can compute drag deltas relative to where the
-                    // gesture began. Better signal would be a live
-                    // `current_content_point` on the kit (planned);
-                    // until that lands drag_delta_local is the drag
-                    // path's reliable read.
-                    self.interaction.drag_start
-                } else if hovered {
-                    // Hovered (not pressed): the kit doesn't surface a
-                    // continuous cursor position yet, so we approximate
-                    // with the widget's rect centre. Hover-driven
-                    // widgets (custom buttons that paint a glow around
-                    // the cursor, sketch overlays that preview a
-                    // brush) get a usable pointer-local without
-                    // needing the kit to expose more. Replace with the
-                    // kit's live pointer once that lands.
-                    Some(Point::new(
-                        rect.x() + rect.width() * 0.5,
-                        rect.y() + rect.height() * 0.5,
-                    ))
+                let pointer_world = if active || hovered {
+                    // Use the kit's live cursor position when present.
+                    // Falls back to drag_start for the active case
+                    // (only fires for the first POINTER_DOWN before
+                    // the kit's continuous tracking populates) and to
+                    // the rect centre for hover when the kit hasn't
+                    // produced any pointer event yet. Both fallbacks
+                    // exist for pre-event paint passes; in steady
+                    // state every drag widget reads the live cursor.
+                    self.interaction.current_content_point.or_else(|| {
+                        if active {
+                            self.interaction.drag_start
+                        } else {
+                            Some(Point::new(
+                                rect.x() + rect.width() * 0.5,
+                                rect.y() + rect.height() * 0.5,
+                            ))
+                        }
+                    })
                 } else {
                     None
                 };
