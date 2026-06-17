@@ -817,6 +817,102 @@ impl<'a> PortalUi<'a> {
 
         result
     }
+
+    /// Run `f` with the cursor laying out vertically. The default
+    /// layout direction is already vertical, but this is useful
+    /// inside a [`Self::horizontal`] scope when you want a sub-column
+    /// of stacked widgets between two horizontally-laid siblings.
+    /// Outside a horizontal scope this just runs the closure.
+    pub fn vertical<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        if matches!(self.layout, LayoutDirection::Vertical) {
+            return f(self);
+        }
+
+        let saved_layout = self.layout;
+        let saved_cursor = self.cursor;
+        let saved_row_height = self.horizontal_row_height;
+        self.layout = LayoutDirection::Vertical;
+        self.horizontal_row_height = 0.0;
+
+        let result = f(self);
+
+        // Inner column bounding box.
+        let inner_width = (self.cursor.x - saved_cursor.x).max(0.0);
+        let inner_height = (self.cursor.y - saved_cursor.y).max(0.0);
+
+        self.layout = saved_layout;
+        self.cursor = saved_cursor;
+        self.horizontal_row_height = saved_row_height;
+
+        // Parent is horizontal (we only entered here from horizontal).
+        // The inner column takes inner_width along the row's primary
+        // axis and contributes inner_height to the row's tallest-child
+        // tracking.
+        if inner_height > 0.0 || inner_width > 0.0 {
+            self.cursor.x += inner_width + self.style.spacing;
+            if inner_height > self.horizontal_row_height {
+                self.horizontal_row_height = inner_height;
+            }
+        }
+
+        result
+    }
+
+    /// Left-indent the closure's content by `px` logical pixels.
+    /// Vertical layout only — in horizontal layout the cursor advances
+    /// horizontally so left-indenting would conflict with sibling
+    /// positioning. Useful for tree-style hierarchies, collapsible
+    /// sections, and any nested-content visual that wants a clear
+    /// left margin.
+    pub fn indent<R>(&mut self, px: f32, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !matches!(self.layout, LayoutDirection::Vertical) {
+            return f(self);
+        }
+        let saved_x = self.cursor.x;
+        self.cursor.x += px;
+        let result = f(self);
+        // Restore cursor.x; cursor.y has advanced for the next sibling.
+        self.cursor.x = saved_x;
+        result
+    }
+
+    /// Indent the closure's content by [`PortalStyle::indent`] —
+    /// the theme's default indent step. Sugar over
+    /// [`Self::indent(self.style().indent, f)`](Self::indent).
+    pub fn indent_step<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.indent(self.style.indent, f)
+    }
+
+    /// Run `f` and return both its result and the bounding rect of
+    /// what it painted. Bounding rect is in canvas-content coords;
+    /// hosts paint frame chrome (group borders, section dividers,
+    /// drop-target highlights) around it without needing to know what
+    /// the closure did internally.
+    ///
+    /// - In vertical layout the width is the full row width and the
+    ///   height is how far the cursor advanced down.
+    /// - In horizontal layout the width is how far the cursor
+    ///   advanced right; height is the row's tallest child.
+    pub fn group<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> (R, blinc_core::layer::Rect) {
+        let start_cursor = self.cursor;
+        let saved_row_height = self.horizontal_row_height;
+        let result = f(self);
+        let end_cursor = self.cursor;
+        let rect = match self.layout {
+            LayoutDirection::Vertical => {
+                let x = self.bounds.x() + self.style.spacing;
+                let w = (self.bounds.width() - self.style.spacing * 2.0).max(0.0);
+                let h = (end_cursor.y - start_cursor.y).max(0.0);
+                blinc_core::layer::Rect::new(x, start_cursor.y, w, h)
+            }
+            LayoutDirection::Horizontal => {
+                let w = (end_cursor.x - start_cursor.x).max(0.0);
+                let h = self.horizontal_row_height.max(saved_row_height);
+                blinc_core::layer::Rect::new(start_cursor.x, start_cursor.y, w, h)
+            }
+        };
+        (result, rect)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
