@@ -1,7 +1,22 @@
-//! Built-in widgets — `label`, `button`, `slider`, `text_input`,
-//! `switch`. Each has a plain (`&mut value`) form and a `_signal`
-//! form that auto-subscribes the portal to the signal it reads.
-//! See `README.md` for usage patterns.
+//! Built-in widgets implemented as [`PortalUi`] inherent-method
+//! extensions: [`label`](PortalUi::label), [`button`](PortalUi::button),
+//! [`switch`](PortalUi::switch), [`slider`](PortalUi::slider),
+//! [`text_input`](PortalUi::text_input).
+//!
+//! Every widget has two forms. The plain form (`label`, `button`,
+//! `switch`, `slider`, `text_input`) takes a `&mut value` the caller
+//! owns and reports mutation via `Response::changed`. The `_signal`
+//! form reads (and on input widgets, writes) a
+//! [`Signal`](blinc_core::reactive::Signal) — reading inside the portal
+//! frame auto-subscribes via [`crate::PortalSubscriptions`], so any
+//! external `Signal::set` flips the portal's dirty flag and the host
+//! repaints. Use signal forms when the value is shared with other
+//! parts of the app; the plain forms are for self-contained widget
+//! state.
+//!
+//! Widgets read sizes and colours from [`PortalStyle`] (theme-derived;
+//! constructed once per frame by the host) so re-styling the active
+//! theme automatically re-themes every portal on the next paint.
 
 use crate::core::{ctrl_radius, PortalStyle, Response, Sense};
 use crate::ui::PortalUi;

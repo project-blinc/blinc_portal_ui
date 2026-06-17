@@ -1,5 +1,15 @@
 //! `PortalPainter` — the painting primitive every widget is built on.
-//! Free-form draw + style-aware helpers. See `README.md`.
+//!
+//! Holds a `&mut DrawContext`, the painter's reserved rect, and the
+//! portal's wall-clock time. Free-form draw methods proxy through to
+//! the underlying context in canvas-content coords; style-aware
+//! helpers (`fill_self`, `stroke_self`, `text`) read [`PortalStyle`]
+//! so widgets stay theme-coherent without re-deriving colours and
+//! metrics each call.
+//!
+//! Reserved via [`crate::PortalUi::allocate_painter`] (which also
+//! returns a [`Response`]) or [`crate::PortalUi::allocate_paint`]
+//! (painter only, for decorative fills).
 
 use crate::core::{ctrl_radius, PortalStyle, Response};
 use blinc_core::draw::{Path, Stroke, TextStyle};
@@ -129,11 +139,14 @@ impl<'a> PortalPainter<'a> {
 }
 
 /// Build the standard [`Response`] for a freshly-allocated painter
-/// from the canvas kit's interaction state. The portal's render-loop
-/// constructs this once for every `allocate_painter` call after the
-/// rect is chosen.
+/// from the canvas kit's interaction state.
+///
+/// Public so custom widget authors who replicate
+/// [`crate::PortalUi::allocate_painter`]'s response shape (for instance
+/// to feed in a synthesized hover state from a non-pointer source) can
+/// reuse the exact construction the built-in widgets get.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_response(
+pub fn build_response(
     rect: Rect,
     region_hovered: bool,
     region_active: bool,

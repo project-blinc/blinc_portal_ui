@@ -1,6 +1,20 @@
-//! Core types: ids, responses, storage, style, host bridge.
+//! Core value types every portal frame moves through.
 //!
-//! See `README.md` for how these compose.
+//! - [`PortalId`] / [`WidgetId`] — stable hash-derived identifiers that
+//!   correlate widget state across frames and namespace canvas-kit hit
+//!   regions so multiple portals never alias on shared keys.
+//! - [`Response`] — what the host gets back from each widget /
+//!   `allocate_painter` call: rect + hover / press / click / drag /
+//!   pointer-local / animating bits. Built once per allocation; custom
+//!   widgets compose it via [`Response::with_clicked`] etc.
+//! - [`Sense`] — the kind of pointer interaction a rect wants, defaulting
+//!   to [`Sense::None`] for paint-only regions.
+//! - [`PortalStorage`] — typed-`Any` scratch cells keyed by [`WidgetId`],
+//!   GC'd at the end of each frame so dropped widgets don't leak.
+//! - [`PortalStyle`] — theme-derived constants (colours, metrics) the
+//!   built-in widgets read each frame.
+//! - [`HostBridge`] — coordinate transforms (canvas ↔ screen) so widgets
+//!   can anchor overlays outside the canvas surface.
 
 use blinc_core::layer::{Color, CornerRadius, Point, Rect};
 use std::any::Any;
@@ -112,6 +126,37 @@ impl Response {
             pointer_local: None,
             drag_delta_local: Point::new(0.0, 0.0),
         }
+    }
+
+    /// Override the rect — useful when a custom widget allocates a
+    /// painter then narrows the hit / response region to a subset
+    /// (e.g. circular thumbs inside square painters).
+    pub fn with_rect(mut self, rect: Rect) -> Self {
+        self.rect = rect;
+        self
+    }
+
+    /// Override the `clicked` bit — for synthetic clicks (keyboard-
+    /// driven activation, scripted UI tests) or to suppress the bit
+    /// when a widget consumed the click internally.
+    pub fn with_clicked(mut self, clicked: bool) -> Self {
+        self.clicked = clicked;
+        self
+    }
+
+    /// Override the `changed` bit — for widgets that own their value
+    /// and want to report mutation back to the caller without going
+    /// through the kit's interaction state.
+    pub fn with_changed(mut self, changed: bool) -> Self {
+        self.changed = changed;
+        self
+    }
+
+    /// Override the `animating` bit — useful when a widget knows its
+    /// internal animation hasn't settled and needs another paint.
+    pub fn with_animating(mut self, animating: bool) -> Self {
+        self.animating = animating;
+        self
     }
 }
 
@@ -355,6 +400,22 @@ impl HostBridge {
         Self {
             canvas_to_screen: Arc::new(|p| p),
             screen_to_canvas: Arc::new(|p| p),
+        }
+    }
+
+    /// Build a bridge from a pair of plain closures. The host writes
+    /// the closures using whatever transform it has on hand (an affine
+    /// from canvas-kit, a 3D projection from a scene kit) and this
+    /// constructor handles the `Arc::new` boxing so caller code stays
+    /// terse.
+    pub fn from_closures<C, S>(canvas_to_screen: C, screen_to_canvas: S) -> Self
+    where
+        C: Fn(Point) -> Point + Send + Sync + 'static,
+        S: Fn(Point) -> Point + Send + Sync + 'static,
+    {
+        Self {
+            canvas_to_screen: Arc::new(canvas_to_screen),
+            screen_to_canvas: Arc::new(screen_to_canvas),
         }
     }
 

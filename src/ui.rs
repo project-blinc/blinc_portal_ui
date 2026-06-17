@@ -1,5 +1,18 @@
-//! `Portal` (persistent host-owned runtime) and `PortalUi`
-//! (per-frame borrow passed to the closure). See `README.md`.
+//! Runtime: [`Portal`], [`PortalUi`], [`PortalManager`].
+//!
+//! [`Portal`] is the persistent runtime the host owns — one per UI
+//! region keyed by a stable host id (a node id, a panel id). The host
+//! constructs it once and calls [`Portal::frame`] every paint pass.
+//! [`PortalUi`] is the per-frame builder handed to the closure; it
+//! holds the cursor / id-stack / layout direction / style and is what
+//! widgets mutate as they paint.
+//!
+//! [`PortalManager`] keeps a `K → Portal` map and the typical
+//! get-or-create / retain-live boilerplate so hosts don't re-implement
+//! it. The clicked-this-frame cache + the scheduler bridge live here
+//! too; both are global side effects scoped to whatever
+//! [`install_click_hook`] sees and what
+//! [`blinc_animation::try_get_scheduler`] returns.
 
 use crate::core::{HostBridge, PortalId, PortalStorage, PortalStyle, Response, Sense, WidgetId};
 use crate::painter::{build_response, PortalPainter};
@@ -31,6 +44,24 @@ static CLICKS: OnceLock<Mutex<ahash::AHashMap<String, Instant>>> = OnceLock::new
 
 fn clicks() -> &'static Mutex<ahash::AHashMap<String, Instant>> {
     CLICKS.get_or_init(|| Mutex::new(ahash::AHashMap::default()))
+}
+
+/// Drop click-stamp entries older than this duration. Bounds the
+/// CLICKS map size in long-running apps: entries from widgets that
+/// disappeared before being observed (a popover dismisses mid-click,
+/// a tree branch collapses between dispatch and paint) would otherwise
+/// stay in the map indefinitely until a fresh widget with the same
+/// region id happens to collide. A click that fires within this
+/// window of being recorded is still observed exactly once on read.
+const CLICK_STAMP_MAX_AGE_MS: u128 = 500;
+
+fn sweep_stale_clicks() {
+    let mut map = clicks().lock().unwrap();
+    if map.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    map.retain(|_, stamped| now.duration_since(*stamped).as_millis() < CLICK_STAMP_MAX_AGE_MS);
 }
 
 /// Install the kit-side click recorder. Hosts call this ONCE after
@@ -177,6 +208,10 @@ impl Portal {
         let frame_start = Instant::now();
         self.subs.clear_dirty();
         self.storage.used_this_frame.clear();
+        // Drop click stamps from widgets that disappeared before any
+        // paint observed them. Cheap (~O(map size)), runs once per
+        // portal-frame; the per-widget read still does its own remove.
+        sweep_stale_clicks();
         let interaction = kit.interaction();
 
         // Push the clip frame BEFORE building the UI so every
@@ -378,6 +413,21 @@ impl<'a> PortalUi<'a> {
         self.bounds
     }
 
+    /// Current cursor position in canvas-content coordinates — the
+    /// origin the next `allocate_painter` will use. Lets custom
+    /// layout helpers read where the cursor sits without reaching
+    /// into the type's internals.
+    pub fn cursor(&self) -> Point {
+        self.cursor
+    }
+
+    /// Active layout direction (vertical or horizontal). Useful for
+    /// widgets that adapt their secondary-axis sizing based on which
+    /// way the cursor is advancing.
+    pub fn layout(&self) -> LayoutDirection {
+        self.layout
+    }
+
     /// Remaining space inside the portal's bounds, measured from the
     /// cursor in the layout's primary direction.
     pub fn available_size(&self) -> (f32, f32) {
@@ -496,17 +546,27 @@ impl<'a> PortalUi<'a> {
                 self.kit.hit_rect(region_id.clone(), rect);
                 let hovered = self.interaction.hovered.as_deref() == Some(region_id.as_str());
                 let active = self.interaction.active.as_deref() == Some(region_id.as_str());
-                let pointer_world = if hovered || active {
-                    // Approximate pointer position: derive from
-                    // active drag_start when pressed, else hovered
-                    // region centre. Better: kit could expose a
-                    // `current_content_point`, but absent that this is
-                    // a reasonable read for hover-driven widgets.
-                    if active {
-                        self.interaction.drag_start
-                    } else {
-                        None
-                    }
+                let pointer_world = if active {
+                    // Pressed: use the kit's drag_start so the widget
+                    // can compute drag deltas relative to where the
+                    // gesture began. Better signal would be a live
+                    // `current_content_point` on the kit (planned);
+                    // until that lands drag_delta_local is the drag
+                    // path's reliable read.
+                    self.interaction.drag_start
+                } else if hovered {
+                    // Hovered (not pressed): the kit doesn't surface a
+                    // continuous cursor position yet, so we approximate
+                    // with the widget's rect centre. Hover-driven
+                    // widgets (custom buttons that paint a glow around
+                    // the cursor, sketch overlays that preview a
+                    // brush) get a usable pointer-local without
+                    // needing the kit to expose more. Replace with the
+                    // kit's live pointer once that lands.
+                    Some(Point::new(
+                        rect.x() + rect.width() * 0.5,
+                        rect.y() + rect.height() * 0.5,
+                    ))
                 } else {
                     None
                 };
@@ -581,5 +641,110 @@ impl<'a> PortalUi<'a> {
             }
         }
         result
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// PortalManager — convenience map for hosts that own a portal per key
+// ─────────────────────────────────────────────────────────────────────
+
+/// `K → Portal` map plus the typical get-or-create / retain-live
+/// plumbing every host writes anyway.
+///
+/// Hosts that own multiple portals (one per node in a node editor,
+/// one per pane in a multi-pane layout, etc.) typically write the
+/// same `HashMap<K, Portal>` + retain-by-live-set + lookup logic in
+/// every implementation. This struct owns that pattern. Construct
+/// once, call [`Self::get_or_make`] inside the paint loop, and call
+/// [`Self::retain`] once per frame to drop portals for keys that no
+/// longer exist.
+///
+/// The map is keyed by `K` (not by `PortalId`) so [`Self::retain`]
+/// can compare against the host's live-key set without round-tripping
+/// through the hash.
+pub struct PortalManager<K: std::hash::Hash + Eq + Clone> {
+    portals: std::collections::HashMap<K, Portal>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> Default for PortalManager<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> PortalManager<K> {
+    /// Empty manager. No allocation until the first
+    /// [`Self::get_or_make`] call.
+    pub fn new() -> Self {
+        Self {
+            portals: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Look up the portal bound to `key`, constructing a fresh one
+    /// (with `Portal::new(&key)`) if none exists. Returned reference
+    /// is valid for the lifetime of `self`; the caller threads it
+    /// through [`Portal::frame`] and discards the borrow.
+    pub fn get_or_make(&mut self, key: K) -> &mut Portal {
+        self.portals
+            .entry(key.clone())
+            .or_insert_with(|| Portal::new(&key))
+    }
+
+    /// Drop portals whose key is no longer "live" per `keep`. Hosts
+    /// pass a predicate that consults their own live-set (e.g.
+    /// `|k| graph.nodes.contains_key(k)`) and the manager drops the
+    /// portals that fall out. Each dropped portal's `Drop` cleans up
+    /// its scheduler tick callback and signal subscriptions.
+    pub fn retain<F: FnMut(&K) -> bool>(&mut self, mut keep: F) {
+        self.portals.retain(|k, _| keep(k));
+    }
+
+    /// Last-frame consumed-height for the portal under `key`, or
+    /// `0.0` if no portal exists yet. The host typically feeds this
+    /// back as next-frame bounds so the slot grows with content.
+    pub fn consumed_height(&self, key: &K) -> f32 {
+        self.portals.get(key).map_or(0.0, Portal::consumed_height)
+    }
+
+    /// Number of live portals tracked.
+    pub fn len(&self) -> usize {
+        self.portals.len()
+    }
+
+    /// True when no portals are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.portals.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_manager_get_or_make_constructs_once_per_key() {
+        let mut mgr = PortalManager::<&'static str>::new();
+        assert!(mgr.is_empty());
+        let id_a = mgr.get_or_make("a").id();
+        let id_a_again = mgr.get_or_make("a").id();
+        assert_eq!(id_a, id_a_again, "same key returns same portal id");
+        let id_b = mgr.get_or_make("b").id();
+        assert_ne!(id_a, id_b, "different keys produce distinct portals");
+        assert_eq!(mgr.len(), 2);
+    }
+
+    #[test]
+    fn portal_manager_retain_drops_missing_keys() {
+        let mut mgr = PortalManager::<i32>::new();
+        let _ = mgr.get_or_make(1);
+        let _ = mgr.get_or_make(2);
+        let _ = mgr.get_or_make(3);
+        assert_eq!(mgr.len(), 3);
+        let live = [1_i32, 3_i32];
+        mgr.retain(|k| live.contains(k));
+        assert_eq!(mgr.len(), 2);
+        assert!(mgr.consumed_height(&1) >= 0.0); // 1 still present
+        assert_eq!(mgr.consumed_height(&2), 0.0); // dropped → default
     }
 }

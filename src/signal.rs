@@ -1,6 +1,18 @@
-//! Per-portal signal subscriptions. Routes `notify_portals(SignalId)`
-//! events to per-portal dirty flags. See `README.md` for the
-//! read-tracking + diff-update lifecycle.
+//! Per-portal signal subscription map.
+//!
+//! Every portal frame runs inside [`blinc_core::reactive::with_read_tracking`]
+//! so we know exactly which signals the closure read. [`PortalSubscriptions`]
+//! diffs that read-set against the previous frame's and updates a
+//! process-global registry so future `Signal::set` calls flip the
+//! reading portals' dirty flags. The next host frame observes the flag
+//! and re-runs the portal closure.
+//!
+//! The registry is reverse-indexed both ways (portal → signals,
+//! signal → portals) so dispatch is O(1) on either side. The notifier
+//! collects affected dirty-flag handles under the registry lock,
+//! releases the lock, then flips the atomics — the lock is never
+//! re-entered from the notifier path, so portal code calling
+//! `Signal::set` mid-frame can't deadlock on the registry.
 
 use crate::core::PortalId;
 use blinc_core::reactive::{set_portal_notifier, SignalId};
