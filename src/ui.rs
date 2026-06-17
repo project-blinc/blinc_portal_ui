@@ -428,13 +428,32 @@ impl<'a> PortalUi<'a> {
         self.layout
     }
 
-    /// Remaining space inside the portal's bounds, measured from the
-    /// cursor in the layout's primary direction.
+    /// Remaining space the next widget can grow into.
+    ///
+    /// - `w` is the remaining horizontal room from the cursor to the
+    ///   right edge of the portal bounds (minus trailing spacing pad).
+    ///   In horizontal layout this is what's left of the current row;
+    ///   in vertical it's the full row width.
+    /// - `h` semantics depend on layout direction:
+    ///   - **Vertical**: remaining vertical space from the cursor down
+    ///     to the bottom edge of the portal bounds.
+    ///   - **Horizontal**: a *row height budget* equal to
+    ///     `style.control_height`. Reporting the full remaining
+    ///     vertical extent would over-promise — a tall widget that
+    ///     consumed it would paint past the row's intended footprint
+    ///     and overlap anything stacked below the row.
+    ///
+    /// Widgets that need taller content should compose vertically.
     pub fn available_size(&self) -> (f32, f32) {
         let w =
             (self.bounds.x() + self.bounds.width() - self.cursor.x - self.style.spacing).max(0.0);
-        let h =
-            (self.bounds.y() + self.bounds.height() - self.cursor.y - self.style.spacing).max(0.0);
+        let h = match self.layout {
+            LayoutDirection::Vertical => (self.bounds.y() + self.bounds.height()
+                - self.cursor.y
+                - self.style.spacing)
+                .max(0.0),
+            LayoutDirection::Horizontal => self.style.control_height,
+        };
         (w, h)
     }
 
@@ -619,27 +638,60 @@ impl<'a> PortalUi<'a> {
     }
 
     /// Run `f` with the cursor laying out horizontally — children
-    /// advance the cursor's x. After `f` returns, the parent cursor's
-    /// y advances by the row's tallest child + spacing.
+    /// advance the cursor's x while sharing the same `cursor.y`.
+    ///
+    /// After `f` returns, the inner row is treated as a single
+    /// "compound widget" whose width is how far the inner widgets
+    /// advanced the x cursor and whose height is the row's tallest
+    /// child. The parent cursor is then advanced along the parent's
+    /// own primary axis: down by the row height when the parent is
+    /// vertical, right by the row width when the parent is horizontal
+    /// (nested horizontals stack along a single row). In the nested-
+    /// horizontal case the inner row's height also feeds into the
+    /// outer row's `horizontal_row_height` so the outer row sizes its
+    /// own vertical extent correctly.
     pub fn horizontal<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved_layout = self.layout;
         let saved_cursor = self.cursor;
         let saved_row_height = self.horizontal_row_height;
         self.layout = LayoutDirection::Horizontal;
         self.horizontal_row_height = 0.0;
+
         let result = f(self);
-        let row_height = self.horizontal_row_height;
-        // Restore parent context; advance parent cursor vertically by
-        // the row height plus a spacing gap.
+
+        // Capture the inner row's bounding box BEFORE restoring the
+        // saved cursor. Width = how far the inner widgets advanced x;
+        // height = the tallest child's height in this row.
+        let inner_width = (self.cursor.x - saved_cursor.x).max(0.0);
+        let inner_height = self.horizontal_row_height;
+
+        // Restore parent context.
         self.layout = saved_layout;
         self.cursor = saved_cursor;
         self.horizontal_row_height = saved_row_height;
-        if row_height > 0.0 {
+
+        // Advance the parent cursor in the parent's primary axis.
+        // For a horizontal-in-vertical, that's down by row height.
+        // For a horizontal-in-horizontal, the inner row is one tall
+        // "block" inside the outer row — advance outer x by the inner
+        // row's WIDTH (not height — the previous code added row
+        // height to x, which gave wildly wrong layouts), and bubble
+        // the inner row's height up so the outer row's tallest-child
+        // tracking includes it.
+        if inner_height > 0.0 || inner_width > 0.0 {
             match self.layout {
-                LayoutDirection::Vertical => self.cursor.y += row_height + self.style.spacing,
-                LayoutDirection::Horizontal => self.cursor.x += row_height + self.style.spacing,
+                LayoutDirection::Vertical => {
+                    self.cursor.y += inner_height + self.style.spacing;
+                }
+                LayoutDirection::Horizontal => {
+                    self.cursor.x += inner_width + self.style.spacing;
+                    if inner_height > self.horizontal_row_height {
+                        self.horizontal_row_height = inner_height;
+                    }
+                }
             }
         }
+
         result
     }
 }
