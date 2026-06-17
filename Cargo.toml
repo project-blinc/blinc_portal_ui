@@ -32,7 +32,7 @@ blinc_animation = { git = "https://github.com/project-blinc/Blinc.git", rev = "a
 # (`github.com/project-blinc/blinc_canvas_kit`); the [patch] block
 # below redirects to the colocated local checkout when developed
 # source-local to a Blinc tree.
-blinc_canvas_kit = { git = "https://github.com/project-blinc/blinc_canvas_kit.git", rev = "d07badb7d060dff63647a3afb46a5b58fd8a499e" }
+blinc_canvas_kit = { git = "https://github.com/project-blinc/blinc_canvas_kit.git", rev = "5a932e1273904302e15ec7bcd6a7bd797535cbe0" }
 
 # Cross-target monotonic clock. Portal widgets ease hover / press over
 # time using a per-portal wall clock; `web_time::Instant` is a re-export
