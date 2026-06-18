@@ -25,7 +25,10 @@ pub use crate::core::{
     PortalStorage, PortalStyle, PortalValue, Response, Sense, ShadowMix, ShadowToken,
     ValueBinding, WidgetId,
 };
-pub use crate::widget::{ButtonBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder};
+pub use crate::widget::{
+    ButtonBuilder, NumericInputBuilder, SelectBuilder, SliderBuilder, SwitchBuilder,
+    TextInputBuilder,
+};
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;
 pub use crate::ui::{

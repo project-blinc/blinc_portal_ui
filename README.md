@@ -119,8 +119,15 @@ whole region.
 
 `label`, `label_signal`, `button` (+ `ButtonVariant`: Primary /
 Secondary / Destructive / Outline / Ghost / Link, default Ghost),
-`switch`, `slider`, `text_input`, `select_trigger`, `select`,
-`select_signal`, `spacing`, `horizontal`, `push_id`.
+`switch`, `slider`, `numeric_input`, `text_input`, `select_trigger`,
+`select`, `select_signal`, `spacing`, `horizontal`, `push_id`.
+
+`numeric_input` is dual-mode: drag-to-scrub on the chip OR
+click-to-edit inline. Supports `.min(f32)` / `.max(f32)` /
+`.range(Range<f32>)` / `.step(f32)` / `.integer()` / `.precision(u8)`
+/ `.unit(...)` / `.drag_sensitivity(...)` / `.disabled(b)` plus the
+shared `ShadowMix` shortcuts. Arrow Up/Down nudge by step while
+focused; Enter commits the edit, Esc cancels.
 
 The value-bearing widgets (`switch`, `slider`, `text_input`) accept
 either `&mut value` or `&Signal<value>` via the [`PortalValue`]

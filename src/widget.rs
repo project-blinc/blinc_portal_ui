@@ -739,6 +739,510 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// numeric_input — dual-mode scrub-or-edit numeric field.
+//
+// Idle state: label-shaped chip showing the formatted number; the
+// user drags horizontally to scrub (Sense::Drag). Click without drag
+// enters edit mode where the chip becomes an inline text field for
+// typing a number; Enter / blur commits, Esc cancels. State (mode,
+// caret, scratch buffer, sub-pixel drag accumulator) lives in
+// PortalStorage keyed by a single stable WidgetId reused across
+// both modes so the cursor / hit region never reshuffles when the
+// user switches modes.
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone)]
+struct NumericInputState {
+    /// `true` while the field is in inline-edit (typed-character)
+    /// mode. Toggles from idle on a no-drag click; clears on Enter
+    /// / Esc / blur.
+    editing: bool,
+    /// Caret byte offset within `scratch` while editing.
+    caret: usize,
+    /// Edit-mode scratch buffer. Reseeded from the bound value at
+    /// the moment the user clicks-into-edit and after every
+    /// arrow-key nudge so the displayed text stays in sync.
+    scratch: String,
+    /// Sub-pixel drag accumulator (pixels). Drag-to-scrub
+    /// integrates `drag_delta_local.x` here until a full
+    /// `step * sensitivity` worth has accumulated; the integer
+    /// multiple flushes into the bound value, the fractional
+    /// remainder stays in the accumulator so smooth slow drags
+    /// still advance.
+    drag_accum_pixels: f32,
+    /// Tracks the prior frame's `pressed` state so the rising-edge
+    /// drag-start can reset the accumulator. Without this, a
+    /// new drag inherits leftover sub-pixel from the prior gesture.
+    was_pressed_last_frame: bool,
+}
+
+#[must_use = "NumericInputBuilder is lazy — call .show() / .changed() to paint"]
+pub struct NumericInputBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, f32>,
+    min: Option<f32>,
+    max: Option<f32>,
+    /// Step magnitude per scrub-pixel * sensitivity. `0.0` means
+    /// "no quantise" — value is only clamped to min/max.
+    step: f32,
+    integer: bool,
+    precision: u8,
+    unit: Option<String>,
+    placeholder: Option<String>,
+    drag_sensitivity: f32,
+    width_override: Option<f32>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for NumericInputBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> NumericInputBuilder<'a, 'b> {
+    pub fn min(mut self, v: f32) -> Self {
+        self.min = Some(v);
+        self
+    }
+    pub fn max(mut self, v: f32) -> Self {
+        self.max = Some(v);
+        self
+    }
+    /// Set both `min` and `max` at once — mirrors `SliderBuilder`'s
+    /// range entry style.
+    pub fn range(mut self, range: std::ops::Range<f32>) -> Self {
+        self.min = Some(range.start);
+        self.max = Some(range.end);
+        self
+    }
+    /// Step magnitude per scrub-pixel * sensitivity. `0.0` disables
+    /// quantisation; the value still clamps to `min..=max`.
+    pub fn step(mut self, step: f32) -> Self {
+        self.step = step.max(0.0);
+        self
+    }
+    /// Integer-only mode. Defaults step to `1.0` when step was the
+    /// builder default (still 0.0 from construction); does NOT
+    /// override an explicit `.step(...)` set earlier in the chain.
+    /// On commit / scrub / arrow the value is rounded to the
+    /// nearest integer.
+    pub fn integer(mut self) -> Self {
+        self.integer = true;
+        if self.step == 0.0 {
+            self.step = 1.0;
+        }
+        self
+    }
+    /// Decimal precision used by `format_value` in idle paint and
+    /// the edit-mode reseed. Ignored when `integer` is `true`.
+    pub fn precision(mut self, p: u8) -> Self {
+        self.precision = p;
+        self
+    }
+    /// Trailing unit suffix shown in idle mode only ("ms", "px",
+    /// "%"). Hidden in edit mode so the user types just the number.
+    pub fn unit(mut self, u: impl Into<String>) -> Self {
+        self.unit = Some(u.into());
+        self
+    }
+    pub fn placeholder(mut self, t: impl Into<String>) -> Self {
+        self.placeholder = Some(t.into());
+        self
+    }
+    /// Multiplier on `(drag_delta_local.x * step)` per pixel.
+    /// Default `1.0` — one pixel of drag = one step.
+    pub fn drag_sensitivity(mut self, s: f32) -> Self {
+        self.drag_sensitivity = s.max(0.0);
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::events::KeyCode;
+
+        let NumericInputBuilder {
+            ui,
+            mut value,
+            min,
+            max,
+            step,
+            integer,
+            precision,
+            unit,
+            placeholder,
+            drag_sensitivity,
+            width_override,
+            disabled,
+            shadow_token,
+        } = self;
+        let style = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(72.0, 240.0));
+        let height = style.control_height;
+
+        let widget_id = ui.make_widget_id(None);
+        let portal_id = ui.portal_id;
+
+        // Phase 1: snapshot current state + bound value.
+        let current_raw = value.get();
+        let current = if current_raw.is_finite() {
+            current_raw
+        } else {
+            min.unwrap_or(0.0)
+        };
+        let clamp_value = |v: f32| -> f32 {
+            let v = match (min, max) {
+                (Some(lo), Some(hi)) => v.clamp(lo, hi),
+                (Some(lo), None) => v.max(lo),
+                (None, Some(hi)) => v.min(hi),
+                (None, None) => v,
+            };
+            if integer {
+                v.round()
+            } else if step > 0.0 {
+                let base = min.unwrap_or(0.0);
+                ((v - base) / step).round() * step + base
+            } else {
+                v
+            }
+        };
+
+        let mut state = ui
+            .storage
+            .get_or_insert_with::<NumericInputState, _>(widget_id, NumericInputState::default)
+            .clone();
+        state.caret = state.caret.min(state.scratch.len());
+
+        let focused_before = !disabled && ui.is_focused(widget_id);
+        // Click-outside auto-commit: if we were editing last frame
+        // but focus has since moved (POINTER_DOWN cleared it), parse
+        // and commit before painting this frame.
+        if state.editing && !focused_before {
+            if let Ok(parsed) = state.scratch.parse::<f32>() {
+                let new_val = clamp_value(parsed);
+                if (new_val - current).abs() > f32::EPSILON {
+                    value.set(new_val);
+                }
+            }
+            state.editing = false;
+            state.scratch.clear();
+            state.caret = 0;
+        }
+
+        let mut changed = false;
+
+        // Phase 2: keyboard while focused. Arrow keys nudge in BOTH
+        // modes; Enter / Esc only matter in edit mode.
+        if focused_before {
+            let keys: Vec<crate::ui::KbdKey> = ui.kbd_keys_frame.to_vec();
+            let chars: Vec<char> = ui.kbd_chars_frame.to_vec();
+            let mut commit_blur = false;
+            let mut cancel_blur = false;
+            for k in &keys {
+                let key = KeyCode(k.key_code);
+                if key == KeyCode::ESCAPE {
+                    cancel_blur = true;
+                    break;
+                } else if key == KeyCode::ENTER {
+                    if state.editing {
+                        commit_blur = true;
+                    }
+                } else if key == KeyCode::UP {
+                    let nudge = if step > 0.0 { step } else { 1.0 };
+                    let new_val = clamp_value(current + nudge);
+                    if (new_val - current).abs() > f32::EPSILON {
+                        value.set(new_val);
+                        changed = true;
+                        if state.editing {
+                            state.scratch = format_numeric(new_val, precision, integer);
+                            state.caret = state.scratch.len();
+                        }
+                    }
+                } else if key == KeyCode::DOWN {
+                    let nudge = if step > 0.0 { step } else { 1.0 };
+                    let new_val = clamp_value(current - nudge);
+                    if (new_val - current).abs() > f32::EPSILON {
+                        value.set(new_val);
+                        changed = true;
+                        if state.editing {
+                            state.scratch = format_numeric(new_val, precision, integer);
+                            state.caret = state.scratch.len();
+                        }
+                    }
+                } else if state.editing {
+                    if key == KeyCode::BACKSPACE {
+                        if state.caret > 0 {
+                            let new_caret = prev_char_boundary(&state.scratch, state.caret);
+                            state.scratch.replace_range(new_caret..state.caret, "");
+                            state.caret = new_caret;
+                        }
+                    } else if key == KeyCode::DELETE {
+                        if state.caret < state.scratch.len() {
+                            let next = next_char_boundary(&state.scratch, state.caret);
+                            state.scratch.replace_range(state.caret..next, "");
+                        }
+                    } else if key == KeyCode::LEFT {
+                        state.caret = prev_char_boundary(&state.scratch, state.caret);
+                    } else if key == KeyCode::RIGHT {
+                        state.caret = next_char_boundary(&state.scratch, state.caret);
+                    } else if key == KeyCode::HOME {
+                        state.caret = 0;
+                    } else if key == KeyCode::END {
+                        state.caret = state.scratch.len();
+                    }
+                }
+            }
+            if state.editing {
+                for ch in chars {
+                    if !ch.is_control() {
+                        // Restrict to numeric input — digits, sign,
+                        // decimal separator. Anything else is
+                        // silently dropped. Paste of non-numeric is
+                        // not attempted here.
+                        let allow = ch.is_ascii_digit()
+                            || ch == '-'
+                            || ch == '+'
+                            || (ch == '.' && !integer);
+                        if allow {
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            state
+                                .scratch
+                                .insert_str(state.caret.min(state.scratch.len()), s);
+                            state.caret += s.len();
+                        }
+                    }
+                }
+            }
+
+            if commit_blur {
+                if let Ok(parsed) = state.scratch.parse::<f32>() {
+                    let new_val = clamp_value(parsed);
+                    if (new_val - current).abs() > f32::EPSILON {
+                        value.set(new_val);
+                        changed = true;
+                    }
+                }
+                state.editing = false;
+                state.scratch.clear();
+                state.caret = 0;
+                crate::ui::set_focused_region(None);
+            } else if cancel_blur {
+                state.editing = false;
+                state.scratch.clear();
+                state.caret = 0;
+                crate::ui::set_focused_region(None);
+            }
+        }
+
+        // Phase 3: paint. Allocate the painter with the stable
+        // widget_id so storage / focus / hit-region key the same
+        // entry across mode flips.
+        let resp_clicked;
+        let resp_hovered;
+        let resp_pressed;
+        let resp_rect;
+        let drag_delta_x;
+        {
+            let sense = if disabled { Sense::Hover } else { Sense::Drag };
+            let (mut p, r) = ui.allocate_painter_for_id((width, height), sense, widget_id);
+            resp_clicked = r.clicked;
+            resp_hovered = r.hovered;
+            resp_pressed = r.pressed;
+            resp_rect = r.rect;
+            drag_delta_x = r.drag_delta_local.x;
+
+            if let Some(tok) = shadow_token {
+                if !disabled {
+                    let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                    let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                        .get(tok)
+                        .iter()
+                        .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                        .collect();
+                    p.shadow_self(&style, &stack);
+                }
+            }
+
+            let bg = if disabled {
+                style.field_bg.with_alpha(0.5)
+            } else {
+                style.field_bg
+            };
+            let border = if focused_before || resp_hovered {
+                style.field_border_focus
+            } else {
+                style.field_border
+            };
+            p.fill_self(&style, Brush::Solid(bg));
+            p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
+
+            let text_color = if disabled {
+                style.text_disabled
+            } else {
+                style.text_primary
+            };
+            let mut ts = text_style(&style, text_color);
+            ts.baseline = TextBaseline::Middle;
+            let text_x = p.rect().x() + 8.0;
+            let text_y = p.rect().y() + height * 0.5;
+
+            if state.editing {
+                // Edit mode — render the scratch buffer + caret.
+                if state.scratch.is_empty() {
+                    if let Some(ph) = &placeholder {
+                        let mut pts = ts.clone();
+                        pts.color = style.text_disabled;
+                        p.draw_text(ph, &pts, Point::new(text_x, text_y));
+                    }
+                } else {
+                    p.draw_text(&state.scratch, &ts, Point::new(text_x, text_y));
+                }
+
+                let safe_caret = state.caret.min(state.scratch.len());
+                let before_caret = &state.scratch[..safe_caret];
+                let caret_x = text_x + text_width(before_caret, &style);
+                let caret_top = p.rect().y() + 4.0;
+                let caret_bot = p.rect().y() + p.rect().height() - 4.0;
+                let caret_path = blinc_core::draw::Path::new()
+                    .move_to(caret_x, caret_top)
+                    .line_to(caret_x, caret_bot);
+                p.stroke_path(
+                    &caret_path,
+                    &Stroke::new(1.0),
+                    Brush::Solid(style.text_primary),
+                );
+            } else {
+                // Idle / scrub mode — render the formatted value
+                // + unit suffix.
+                let formatted = format_numeric(current, precision, integer);
+                p.draw_text(&formatted, &ts, Point::new(text_x, text_y));
+                if let Some(u) = &unit {
+                    let unit_x = text_x + text_width(&formatted, &style) + 4.0;
+                    let mut uts = ts.clone();
+                    uts.color = style.text_disabled;
+                    p.draw_text(u, &uts, Point::new(unit_x, text_y));
+                }
+            }
+        } // painter dropped
+
+        // Phase 4: post-paint scrub + click-to-edit. Drag-scrub
+        // runs only in idle mode; editing eats the drag (text
+        // selection wins once that lands).
+        if !disabled && !state.editing {
+            let pressed_now = resp_pressed;
+            if pressed_now && !state.was_pressed_last_frame {
+                state.drag_accum_pixels = 0.0;
+            }
+            if pressed_now && drag_delta_x.abs() > 0.0 {
+                state.drag_accum_pixels += drag_delta_x;
+                let step_per_pixel = if step > 0.0 {
+                    step * drag_sensitivity
+                } else {
+                    drag_sensitivity
+                };
+                let raw_steps = state.drag_accum_pixels * step_per_pixel
+                    / step_per_pixel.max(f32::EPSILON);
+                let integer_steps = raw_steps.trunc();
+                if integer_steps.abs() >= 1.0 {
+                    let new_val = clamp_value(current + integer_steps * step_per_pixel);
+                    if (new_val - current).abs() > f32::EPSILON {
+                        value.set(new_val);
+                        changed = true;
+                    }
+                    state.drag_accum_pixels -= integer_steps;
+                }
+            }
+            state.was_pressed_last_frame = pressed_now;
+        }
+
+        if !disabled && resp_clicked {
+            // Click without drag → enter edit mode. The kit's click
+            // listener only fires when `did_drag` was false, so
+            // reaching here means the user did NOT scrub.
+            state.editing = true;
+            state.scratch = format_numeric(current, precision, integer);
+            state.caret = state.scratch.len();
+            state.drag_accum_pixels = 0.0;
+            crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+        }
+
+        // Persist state back to storage.
+        *ui.storage
+            .get_or_insert_with::<NumericInputState, _>(widget_id, NumericInputState::default) =
+            state;
+
+        if focused_before || resp_pressed {
+            ui.request_animation();
+        }
+
+        let mut resp = Response::empty();
+        resp.rect = resp_rect;
+        resp.hovered = resp_hovered;
+        resp.pressed = resp_pressed;
+        resp.clicked = resp_clicked;
+        resp.changed = changed;
+        resp.widget_id = widget_id;
+        resp
+    }
+
+    pub fn changed(self) -> bool {
+        self.show().changed
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Dual-mode numeric input: drag-to-scrub on the chip OR
+    /// click-to-edit inline. Accepts either `&mut f32` or
+    /// `&Signal<f32>` via [`PortalValue`]. Configure via
+    /// `.range(...)` / `.step(...)` / `.integer()` / `.precision()`
+    /// / `.unit(...)` / `.drag_sensitivity(...)` / `.disabled(...)`
+    /// / `.shadow_*()`. Terminate with `.show()` or `.changed()`.
+    pub fn numeric_input<'b, V: PortalValue<'b, f32>>(
+        &'b mut self,
+        value: V,
+    ) -> NumericInputBuilder<'a, 'b> {
+        NumericInputBuilder {
+            ui: self,
+            value: value.into_binding(),
+            min: None,
+            max: None,
+            step: 0.0,
+            integer: false,
+            precision: 2,
+            unit: None,
+            placeholder: None,
+            drag_sensitivity: 1.0,
+            width_override: None,
+            disabled: false,
+            shadow_token: None,
+        }
+    }
+}
+
+/// Format a numeric value for display. Integer mode rounds
+/// half-to-even via `as i64`; float mode formats with the requested
+/// precision and no trailing-zero trimming so the user sees a stable
+/// width per zoom step.
+fn format_numeric(value: f32, precision: u8, integer: bool) -> String {
+    if integer {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.precision$}", precision = precision as usize)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // text_input — inline editable single-line field.
 //
 // Typing is wired through [`install_kbd_hook`]: the outer canvas div
