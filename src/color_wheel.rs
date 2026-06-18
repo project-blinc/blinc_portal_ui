@@ -34,7 +34,7 @@
 //! canvas closure per the long-standing PRIM_TEXT-in-canvas-overlay
 //! gotcha.
 
-use blinc_core::draw::{Path, Stroke};
+use blinc_core::draw::Path;
 use blinc_core::layer::{Brush, Color, CornerRadius, Gradient, Point, Rect, Vec2};
 use blinc_core::reactive::{signal, Signal};
 use blinc_layout::{canvas, div, Div};
@@ -66,6 +66,12 @@ pub fn color_wheel_panel(hex: Signal<String>) -> Div {
         .to_hsva();
     let hsva = signal((h0, s0, v0, a0));
     let drag_mode = signal(0u8); // 0=idle, 1=ring, 2=sv
+    // Bounds captured at mouse_down so on_drag has a stable origin
+    // even when `EventContext::local_x/y` semantics differ between
+    // the initial hit and subsequent drag dispatches. Mirrors the
+    // pattern in `cn::slider` which uses absolute `mouse_x` + a
+    // stored start.
+    let drag_origin = signal((0.0_f32, 0.0_f32));
 
     // Snapshot constants for closures — atan2 axis convention is
     // (lx).atan2(-ly) so 0° sits at 12 o'clock (matches Photoshop).
@@ -104,7 +110,7 @@ pub fn color_wheel_panel(hex: Signal<String>) -> Div {
         paint_hue_ring(dc, cx, cy, inner_r, outer_r);
         paint_sv_square(dc, sv_x, sv_y, sv_side, h);
         paint_hue_marker(dc, cx, cy, (inner_r + outer_r) * 0.5, h);
-        paint_sv_marker(dc, sv_x, sv_y, sv_side, s, v);
+        paint_sv_marker(dc, sv_x, sv_y, sv_side, s, v, h);
     })
     .w(WHEEL_PX)
     .h(WHEEL_PX);
@@ -116,7 +122,13 @@ pub fn color_wheel_panel(hex: Signal<String>) -> Div {
     let hex_on_down = hex.clone();
     let hsva_on_down = hsva;
     let drag_on_down = drag_mode;
+    let origin_on_down = drag_origin;
     let on_mouse_down = move |ctx: &blinc_layout::EventContext| {
+        // Cache the panel's absolute top-left so `on_drag` can map
+        // its `mouse_x/mouse_y` back into wheel-local space without
+        // relying on `local_x/y` (which may not refresh for drag
+        // dispatches on every platform).
+        origin_on_down.set((ctx.bounds_x, ctx.bounds_y));
         let lx = ctx.local_x - cx;
         let ly = ctx.local_y - cy;
         let r = (lx * lx + ly * ly).sqrt();
@@ -141,19 +153,27 @@ pub fn color_wheel_panel(hex: Signal<String>) -> Div {
     let hex_on_drag = hex.clone();
     let hsva_on_drag = hsva;
     let drag_on_drag = drag_mode;
+    let origin_on_drag = drag_origin;
     let on_drag = move |ctx: &blinc_layout::EventContext| {
         let mode = drag_on_drag.get();
+        let (bx, by) = origin_on_drag.get();
+        // `mouse_x/y` are absolute window coords (`cn::slider` uses
+        // these for its drag delta), so subtracting the captured
+        // panel origin gives the wheel-local position regardless of
+        // whether `ctx.local_x/y` refreshed for this dispatch.
+        let lx = (ctx.mouse_x - bx) - cx;
+        let ly = (ctx.mouse_y - by) - cy;
+        let local_x = ctx.mouse_x - bx;
+        let local_y = ctx.mouse_y - by;
         let (h_kept, s_kept, v_kept, a) = hsva_on_drag.get();
         match mode {
             1 => {
-                let lx = ctx.local_x - cx;
-                let ly = ctx.local_y - cy;
                 let h_new = lx.atan2(-ly).to_degrees().rem_euclid(360.0);
                 commit_hsva(h_new, s_kept, v_kept, a, hsva_on_drag, &hex_on_drag);
             }
             2 => {
-                let s_new = ((ctx.local_x - sv_x) / sv_side).clamp(0.0, 1.0);
-                let v_new = 1.0 - ((ctx.local_y - sv_y) / sv_side).clamp(0.0, 1.0);
+                let s_new = ((local_x - sv_x) / sv_side).clamp(0.0, 1.0);
+                let v_new = 1.0 - ((local_y - sv_y) / sv_side).clamp(0.0, 1.0);
                 commit_hsva(h_kept, s_new, v_new, a, hsva_on_drag, &hex_on_drag);
             }
             _ => {}
@@ -261,9 +281,16 @@ fn paint_hue_marker(
 ) {
     let a = hue_deg.to_radians();
     let p = polar(cx, cy, r_mid, a);
-    // White outer + black inner for contrast against any hue.
-    dc.stroke_circle(p, 7.0, &Stroke::new(2.0), Brush::Solid(Color::WHITE));
-    dc.stroke_circle(p, 7.0, &Stroke::new(1.0), Brush::Solid(Color::BLACK));
+    // Two stacked SDF fill_circles — white outer ring + pure-hue
+    // inner disk. `stroke_circle` inside canvas closures composites
+    // poorly against the path-tessellated hue ring (the stroke
+    // primitive emits axis-aligned bounds that read as a faceted
+    // outline at small radii), so we fall through to two solid
+    // disks. Both go through the SDF circle pipeline, which
+    // smoothsteps the edge fragment perfectly at any radius.
+    let pure_hue = Color::from_hsva(hue_deg, 1.0, 1.0, 1.0);
+    dc.fill_circle(p, 9.0, Brush::Solid(Color::WHITE));
+    dc.fill_circle(p, 6.5, Brush::Solid(pure_hue));
 }
 
 fn paint_sv_marker(
@@ -273,12 +300,16 @@ fn paint_sv_marker(
     sv_side: f32,
     s: f32,
     v: f32,
+    hue_deg: f32,
 ) {
     let px = sv_x + s * sv_side;
     let py = sv_y + (1.0 - v) * sv_side;
     let p = Point::new(px, py);
-    dc.stroke_circle(p, 5.0, &Stroke::new(2.0), Brush::Solid(Color::WHITE));
-    dc.stroke_circle(p, 5.0, &Stroke::new(1.0), Brush::Solid(Color::BLACK));
+    // Outer white disk, inner disk at the picked colour so the
+    // marker doubles as a preview swatch at the exact pick point.
+    let picked = Color::from_hsva(hue_deg, s, v, 1.0);
+    dc.fill_circle(p, 8.0, Brush::Solid(Color::WHITE));
+    dc.fill_circle(p, 5.5, Brush::Solid(picked));
 }
 
 // ─── Math helpers ───────────────────────────────────────────────────

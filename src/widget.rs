@@ -1732,7 +1732,7 @@ impl<'a, 'b> ColorPickerBuilder<'a, 'b> {
         // alpha-included form.
         let hex_w = text_width(&hex, &style).max(text_width("#ffffff", &style));
         let swatch_size = (height - 8.0).max(12.0);
-        let default_w = swatch_size + 6.0 + hex_w + 22.0;
+        let default_w = swatch_size + 6.0 + hex_w + 12.0;
         let width = width_override.unwrap_or(default_w);
 
         let sense = if disabled { Sense::Hover } else { Sense::Click };
@@ -1797,23 +1797,6 @@ impl<'a, 'b> ColorPickerBuilder<'a, 'b> {
         if !hex.is_empty() {
             p.draw_text(&hex, &ts, Point::new(label_x, label_y));
         }
-
-        // Chevron — same shape as select_trigger so the affordance
-        // reads as "press to open menu" across both widgets.
-        let chev_cx = p.rect().x() + p.rect().width() - 12.0;
-        let chev_cy = p.rect().y() + p.rect().height() * 0.5;
-        let chev_half_w = 4.0_f32;
-        let chev_half_h = 2.5_f32;
-        let chev_path = blinc_core::draw::Path::new()
-            .move_to(chev_cx - chev_half_w, chev_cy - chev_half_h)
-            .line_to(chev_cx, chev_cy + chev_half_h)
-            .line_to(chev_cx + chev_half_w, chev_cy - chev_half_h);
-        let chev_color = if disabled {
-            style.text_disabled
-        } else {
-            style.text_secondary
-        };
-        p.stroke_path(&chev_path, &Stroke::new(1.5), Brush::Solid(chev_color));
 
         if disabled {
             resp.clicked = false;
