@@ -1098,7 +1098,9 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
             let text_y = p.rect().y() + height * 0.5;
 
             if state.editing {
-                // Edit mode — render the scratch buffer + caret.
+                // Edit mode — left-aligned so the caret can sit at
+                // a stable x while the user types. Right-edge
+                // padding mirrors `text_input`.
                 if state.scratch.is_empty() {
                     if let Some(ph) = &placeholder {
                         let mut pts = ts.clone();
@@ -1123,15 +1125,29 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
                     Brush::Solid(style.text_primary),
                 );
             } else {
-                // Idle / scrub mode — render the formatted value
-                // + unit suffix.
+                // Idle / scrub mode — centred text. The number is
+                // the primary affordance and the unit (if any)
+                // trails it as a single visually-balanced block:
+                // measure both, paint the number centred over
+                // `(rect.width() - unit_block_width) * 0.5` so the
+                // combined glyph row stays optically centred.
                 let formatted = format_numeric(current, precision, integer);
-                p.draw_text(&formatted, &ts, Point::new(text_x, text_y));
-                if let Some(u) = &unit {
-                    let unit_x = text_x + text_width(&formatted, &style) + 4.0;
-                    let mut uts = ts.clone();
-                    uts.color = style.text_disabled;
-                    p.draw_text(u, &uts, Point::new(unit_x, text_y));
+                let unit_text = unit.as_deref();
+                let unit_w = match unit_text {
+                    Some(u) if !u.is_empty() => text_width(u, &style) + 4.0,
+                    _ => 0.0,
+                };
+                let num_w = text_width(&formatted, &style);
+                let row_w = num_w + unit_w;
+                let row_x = p.rect().x() + (p.rect().width() - row_w) * 0.5;
+                p.draw_text(&formatted, &ts, Point::new(row_x, text_y));
+                if let Some(u) = unit_text {
+                    if !u.is_empty() {
+                        let unit_x = row_x + num_w + 4.0;
+                        let mut uts = ts.clone();
+                        uts.color = style.text_disabled;
+                        p.draw_text(u, &uts, Point::new(unit_x, text_y));
+                    }
                 }
             }
         } // painter dropped
