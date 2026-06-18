@@ -1118,6 +1118,39 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
                 style.field_border
             };
             p.fill_self(&style, Brush::Solid(bg));
+
+            // Progress affordance — a subtle accent-tinted fill whose
+            // width tracks the current value's position inside the
+            // `[min, max]` range. Acts as a fuel gauge so users
+            // scrubbing without watching the digits still see motion.
+            // Only rendered when BOTH bounds are set (no scale without
+            // a range) and the value is inside the band. Left-rounded
+            // to match the chip silhouette; right-rounded only at the
+            // 100% edge so the partial-fill terminator stays sharp.
+            if let (Some(lo), Some(hi)) = (min, max) {
+                let span = hi - lo;
+                if span > f32::EPSILON {
+                    let frac = ((current - lo) / span).clamp(0.0, 1.0);
+                    if frac > 0.0 {
+                        let chip = p.rect();
+                        let fill_w = chip.width() * frac;
+                        let fill_rect = blinc_core::layer::Rect::new(
+                            chip.x(),
+                            chip.y(),
+                            fill_w,
+                            chip.height(),
+                        );
+                        let r = style.control_radius;
+                        let right_r = if frac >= 0.9999 { r } else { 0.0 };
+                        let radius =
+                            blinc_core::layer::CornerRadius::new(r, right_r, right_r, r);
+                        let tint_alpha = if disabled { 0.06 } else { 0.18 };
+                        let tint = style.accent.with_alpha(tint_alpha);
+                        p.fill_rect(fill_rect, radius, Brush::Solid(tint));
+                    }
+                }
+            }
+
             p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
 
             let text_color = if disabled {
