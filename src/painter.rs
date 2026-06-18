@@ -102,6 +102,93 @@ impl<'a> PortalPainter<'a> {
 
     // ── Style-aware convenience helpers used by built-in widgets ──
 
+    /// Emit one [`blinc_core::layer::Shadow`] per layer in the stack
+    /// at the painter's full bounds. MUST be called BEFORE
+    /// `fill_self` so the shadow primitive sorts behind the fill.
+    /// Layers paint back-to-front (deepest first) — same order as
+    /// the renderer's box-shadow walker. Empty stack short-circuits
+    /// so Ghost / Link / disabled variants emit no primitives.
+    pub fn shadow_self(&mut self, style: &PortalStyle, stack: &[blinc_core::layer::Shadow]) {
+        if stack.is_empty() {
+            return;
+        }
+        let radius = ctrl_radius(style);
+        for s in stack.iter().rev() {
+            self.ctx.draw_shadow(self.rect, radius, s.clone());
+        }
+    }
+
+    /// Drop shadow under a specific rect (not the painter's full
+    /// bounds). Useful when a widget paints a sub-rect that's
+    /// smaller than its hit region — e.g. a slider's track sitting
+    /// inside a wider painter. Same paint-order rule: emit before
+    /// the fill.
+    pub fn shadow_rect(
+        &mut self,
+        rect: blinc_core::layer::Rect,
+        radius: blinc_core::layer::CornerRadius,
+        stack: &[blinc_core::layer::Shadow],
+    ) {
+        if stack.is_empty() {
+            return;
+        }
+        for s in stack.iter().rev() {
+            self.ctx.draw_shadow(rect, radius, s.clone());
+        }
+    }
+
+    /// Inset (inner) shadow under the painter's full bounds. Same
+    /// stack semantics as `shadow_self` but the renderer projects
+    /// the shadow INTO the rect — produces a recessed-surface look
+    /// (sunken track, pressed-in field).
+    pub fn inner_shadow_self(
+        &mut self,
+        style: &PortalStyle,
+        stack: &[blinc_core::layer::Shadow],
+    ) {
+        if stack.is_empty() {
+            return;
+        }
+        let radius = ctrl_radius(style);
+        for s in stack.iter().rev() {
+            self.ctx.draw_inner_shadow(self.rect, radius, s.clone());
+        }
+    }
+
+    /// Inset shadow under a specific rect with an explicit corner
+    /// radius — companion to `shadow_rect` for inset.
+    pub fn inner_shadow_rect(
+        &mut self,
+        rect: blinc_core::layer::Rect,
+        radius: blinc_core::layer::CornerRadius,
+        stack: &[blinc_core::layer::Shadow],
+    ) {
+        if stack.is_empty() {
+            return;
+        }
+        for s in stack.iter().rev() {
+            self.ctx.draw_inner_shadow(rect, radius, s.clone());
+        }
+    }
+
+    /// Radially symmetric drop shadow under a circle. Sequence
+    /// rule: emit BEFORE the circle fill so the shadow sorts
+    /// behind. Used by switch thumbs / slider thumbs that want a
+    /// subtle lift off the track surface.
+    pub fn circle_shadow(
+        &mut self,
+        center: Point,
+        radius: f32,
+        stack: &[blinc_core::layer::Shadow],
+    ) {
+        if stack.is_empty() {
+            return;
+        }
+        for s in stack.iter().rev() {
+            self.ctx.draw_circle_shadow(center, radius, s.clone());
+        }
+    }
+
     /// Filled rounded rect at the painter's full bounds, with control
     /// radius from `style`. The single most-painted shape in the
     /// portal — every button / field / slider track uses it.
@@ -166,5 +253,9 @@ pub fn build_response(
         animating: false,
         pointer_local,
         drag_delta_local: drag_delta_content,
+        // Filled in by `allocate_painter_with_key` after the kit's
+        // hit-region is registered; callers using `build_response`
+        // directly get the default.
+        widget_id: Default::default(),
     }
 }

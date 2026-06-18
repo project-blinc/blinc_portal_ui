@@ -39,7 +39,7 @@ portal.frame(ctx, &kit, body_rect, &PortalStyle::from_active_theme(), &host_brid
     |ui| {
         ui.label("Threshold");
         ui.slider_signal(&threshold, 0.0..1.0);
-        if ui.button(if running.get() { "Stop" } else { "Run" }).clicked {
+        if ui.button(if running.get() { "Stop" } else { "Run" }).clicked() {
             running.toggle();
         }
         ui.label_signal(&display_pct);
@@ -67,11 +67,34 @@ to canvas-content to screen, via `HostBridge::canvas_to_screen`)
 and does nothing else.
 
 ```rust
-if ui.button("Open").clicked {
+if ui.button("Open").clicked() {
     let anchor = host_bridge.rect_to_screen(response.rect);
     OverlayManager::show(my_popover_content(), anchor);
 }
 ```
+
+## Button variants
+
+`button` returns a deferred `ButtonBuilder`. Fluent variant setters
+match `cn::ButtonVariant` one-to-one — `Primary`, `Secondary`,
+`Destructive`, `Outline`, `Ghost`, `Link` — and the cross-variant
+`.disabled(bool)` toggle resolves to a single shared disabled
+palette regardless of variant (`cn::button` parity). The terminal
+call is `.show() -> Response` or one of the boolean shortcuts
+(`.clicked()`, `.hovered()`, `.pressed()`, `.changed()`).
+
+```rust
+if ui.button("Reset").clicked() { reset(); }                 // default Ghost
+if ui.button("Delete").destructive().clicked() { delete(); }
+ui.button("Save").primary().disabled(!is_valid).show();
+let resp = ui.button(label).variant(cfg.variant).show();      // programmatic
+```
+
+**Default variant is `Ghost`, not `Primary`** — deliberate
+divergence from `cn::button`. Portal buttons live inside node
+content slots where a Primary fill would dominate the canvas;
+Ghost is the right inline default. Use `.primary()` explicitly to
+opt into the saturated treatment.
 
 ## Free-form paint
 
@@ -94,9 +117,32 @@ whole region.
 
 ## Built-in widgets
 
-`label`, `label_signal`, `button`, `slider`, `slider_signal`,
-`switch`, `switch_signal`, `text_input`, `text_input_signal`,
-`spacing`, `horizontal`, `push_id`.
+`label`, `label_signal`, `button` (+ `ButtonVariant`: Primary /
+Secondary / Destructive / Outline / Ghost / Link, default Ghost),
+`switch`, `slider`, `text_input`, `select_trigger`, `select`,
+`select_signal`, `spacing`, `horizontal`, `push_id`.
+
+The value-bearing widgets (`switch`, `slider`, `text_input`) accept
+either `&mut value` or `&Signal<value>` via the [`PortalValue`]
+trait — one entry-method works for both. Each returns a Builder
+(`SwitchBuilder` / `SliderBuilder` / `TextInputBuilder` /
+`SelectBuilder`) that supports `.disabled(b)`, palette overrides,
+and the [`ShadowMix`] shadow surface (`.shadow_sm/.shadow_md/.shadow_lg/
+.shadow_xl/.shadow_2xl/.shadow_inner/.shadow_default/.shadow_none`
+plus `.shadow(ShadowToken)`). Terminate with `.show()` for the
+full [`Response`] or `.clicked()` / `.changed()` for booleans.
+
+The pre-cascade `*_signal` free methods stay as `#[deprecated]`
+shims so existing call sites compile; new code should use
+`ui.switch(&sig).show()` etc.
+
+`select_trigger` / `select` / `select_signal` paint a dropdown
+trigger only. Opening the menu is the host's job — the trigger
+returns a [`Response`] whose `rect` field can be transformed via
+`ui.host().rect_to_screen(...)` and anchored against any overlay
+the host provides (`blinc_cn::context_menu` is the standard for
+Blinc apps). See `node_editor_demo`'s Sink node for the canonical
+recipe.
 
 Custom widgets are one-liners over `allocate_painter`:
 
@@ -108,15 +154,36 @@ fn star_button(ui: &mut PortalUi, rating: u8) -> u8 {
 }
 ```
 
+## Inline text editing
+
+`text_input` / `text_input_signal` accept typed characters directly
+when focused: click to focus, type to edit, Esc / click elsewhere
+to release. Backspace / Delete / Home / End / arrow keys all
+behave as expected; selection / clipboard / IME are not yet wired.
+
+Hosts opt in by wrapping the outer canvas div with
+[`install_kbd_hook`]:
+
+```rust
+let outer = ldiv().w_full().h_full().child(canvas);
+let outer = blinc_portal_ui::ui::install_kbd_hook(outer);
+```
+
+The hook attaches additive `on_key_down` + `on_text_input` handlers
+that push events into process-global buffers; `Portal::frame`
+drains them at the start of every paint and routes them to the
+focused widget. Global focus state is exposed via
+[`current_focused_region`] / [`set_focused_region`] for hosts that
+want to coordinate focus with their own retained-mode widgets.
+
 ## Not yet built
 
-- Text input renders as read-only display until canvas-kit
-  surfaces a typed-character dispatch path. Click-to-open-overlay
-  is the workaround.
 - No flexbox. Layout combinators are vertical / horizontal stack +
   indent.
-- No focus traversal (Tab). Lands when canvas-kit grows keyboard
-  routing.
+- No Tab traversal between portal_ui widgets — focus moves only on
+  pointer click.
+- Selection (drag-to-select), clipboard (Cmd+C / V / X), and IME
+  composition for `text_input`.
 
 ## Modules
 

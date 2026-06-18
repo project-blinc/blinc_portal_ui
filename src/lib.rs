@@ -21,8 +21,11 @@ pub mod ui;
 pub mod widget;
 
 pub use crate::core::{
-    HostBridge, PortalId, PortalStorage, PortalStyle, Response, Sense, WidgetId,
+    ButtonPalette, ButtonPalettes, ButtonShadows, ButtonVariant, HostBridge, PortalId,
+    PortalStorage, PortalStyle, PortalValue, Response, Sense, ShadowMix, ShadowToken,
+    ValueBinding, WidgetId,
 };
+pub use crate::widget::{ButtonBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder};
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;
 pub use crate::ui::{

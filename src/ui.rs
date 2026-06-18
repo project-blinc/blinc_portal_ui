@@ -79,6 +79,173 @@ pub fn install_click_hook(kit: &mut CanvasKit) {
             clicks().lock().unwrap().insert(id.clone(), Instant::now());
         }
     });
+    // Blur-on-click-outside. Every POINTER_DOWN clears the
+    // global focus; if the same dispatch produces a POINTER_UP
+    // over a focusable widget (no drag), the kit's click
+    // listener above stamps CLICKS, the widget's
+    // `allocate_painter` consumes the stamp on the next paint,
+    // and `Response.clicked` re-sets focus to the new region.
+    // Empty-canvas / non-focusable-widget clicks end with
+    // focus cleared — the imgui contract every form expects.
+    kit.on_any_event(|evt: &blinc_layout::event_handler::EventContext| {
+        if evt.event_type == blinc_core::events::event_types::POINTER_DOWN {
+            *focused_region().lock().unwrap() = None;
+            // Re-paint so widgets that depended on focus state
+            // (caret, focus border) drop their treatment on this
+            // frame even if the click didn't land on any portal
+            // widget. Cheap — coalesces with the same-frame paint
+            // requests from the underlying widgets.
+            blinc_layout::request_redraw();
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Keyboard capture — process-global buffers populated by an outer
+// Div hook, drained by Portal::frame each pass.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-frame keyboard event captured from the outer div's
+/// `on_key_down` handler. Portal frames drain the queue at start of
+/// frame so widgets observe each key edge exactly once.
+#[derive(Clone, Copy, Debug)]
+pub struct KbdKey {
+    pub key_code: u32,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub meta: bool,
+}
+
+static KBD_KEYS: OnceLock<Mutex<Vec<KbdKey>>> = OnceLock::new();
+static KBD_CHARS: OnceLock<Mutex<Vec<char>>> = OnceLock::new();
+
+/// Per-frame snapshot cache. `Portal::frame` calls `take_kbd_snapshot`
+/// which decides whether this call is the first in a new paint frame
+/// (drains the live buffers into the cache and stamps `LAST_DRAIN`)
+/// or a subsequent portal within the same paint frame (returns a
+/// clone of the cache so every portal in the frame sees the same
+/// key / char stream).
+///
+/// Frame-edge detection is timestamp-based: if more than
+/// `FRAME_EDGE_MS` has elapsed since the last drain we treat it as a
+/// new frame. Portals within a single canvas paint pass run in
+/// microseconds; the gap between frames at 60Hz is 16.6ms, at 144Hz
+/// is ~7ms — both well above the 5ms threshold.
+static CACHED_KEYS: OnceLock<Mutex<Vec<KbdKey>>> = OnceLock::new();
+static CACHED_CHARS: OnceLock<Mutex<Vec<char>>> = OnceLock::new();
+static LAST_DRAIN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+const FRAME_EDGE_MS: u128 = 5;
+
+/// Globally-focused portal-ui widget region id. `Some(region_id)` while
+/// a `text_input` (or any other key-consuming widget) is focused.
+/// Cleared by widgets on blur (Esc, click outside, etc).
+static FOCUSED_REGION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn kbd_keys() -> &'static Mutex<Vec<KbdKey>> {
+    KBD_KEYS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn kbd_chars() -> &'static Mutex<Vec<char>> {
+    KBD_CHARS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_keys() -> &'static Mutex<Vec<KbdKey>> {
+    CACHED_KEYS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_chars() -> &'static Mutex<Vec<char>> {
+    CACHED_CHARS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn last_drain() -> &'static Mutex<Option<Instant>> {
+    LAST_DRAIN.get_or_init(|| Mutex::new(None))
+}
+
+/// First portal of a new paint frame drains the live KBD buffers
+/// into the cache; later portals within the same frame reuse the
+/// cache so multiple portals in one canvas paint pass all see the
+/// same key / char stream. Returns owned Vecs the caller stores as
+/// the per-frame snapshot.
+fn take_kbd_snapshot() -> (Vec<KbdKey>, Vec<char>) {
+    let now = Instant::now();
+    let mut last = last_drain().lock().unwrap();
+    let new_frame = match *last {
+        None => true,
+        Some(t) => now.duration_since(t).as_millis() >= FRAME_EDGE_MS,
+    };
+    if new_frame {
+        // Drain the live buffers into the cache. Subsequent portals
+        // in the same frame will see the same data via the cache
+        // clone path below.
+        let keys: Vec<KbdKey> = std::mem::take(&mut *kbd_keys().lock().unwrap());
+        let chars: Vec<char> = std::mem::take(&mut *kbd_chars().lock().unwrap());
+        *cached_keys().lock().unwrap() = keys.clone();
+        *cached_chars().lock().unwrap() = chars.clone();
+        *last = Some(now);
+        (keys, chars)
+    } else {
+        let keys = cached_keys().lock().unwrap().clone();
+        let chars = cached_chars().lock().unwrap().clone();
+        (keys, chars)
+    }
+}
+
+fn focused_region() -> &'static Mutex<Option<String>> {
+    FOCUSED_REGION.get_or_init(|| Mutex::new(None))
+}
+
+/// Wrap a [`Div`](blinc_layout::div::Div) with portal-ui's keyboard
+/// capture handlers. Hosts that want inline text-editable portal
+/// widgets (text_input typing, future number input) call this on the
+/// outer div that contains the canvas. The handlers push events into
+/// process-global buffers; `Portal::frame` drains them at the start of
+/// each frame so widgets observe each key / char exactly once on the
+/// next paint pass.
+///
+/// Idempotent against unrelated handlers: this attaches `on_key_down`
+/// + `on_text_input` via the additive Div handler system, so any host
+/// keyboard handler on the same div continues to fire alongside.
+///
+/// Returns the wrapped Div so the call chains in a builder:
+/// ```ignore
+/// let outer = ldiv().w_full().h_full().child(canvas);
+/// let outer = blinc_portal_ui::ui::install_kbd_hook(outer);
+/// ```
+pub fn install_kbd_hook(div: blinc_layout::div::Div) -> blinc_layout::div::Div {
+    use blinc_layout::event_handler::EventContext;
+    div.on_key_down(|evt: &EventContext| {
+        kbd_keys().lock().unwrap().push(KbdKey {
+            key_code: evt.key_code,
+            shift: evt.shift,
+            ctrl: evt.ctrl,
+            alt: evt.alt,
+            meta: evt.meta,
+        });
+    })
+    .on_text_input(|evt: &EventContext| {
+        if let Some(ch) = evt.key_char {
+            // Filter control characters (Backspace, Enter, etc.) —
+            // those flow through KEY_DOWN. TEXT_INPUT carries the
+            // printable character stream only.
+            if !ch.is_control() {
+                kbd_chars().lock().unwrap().push(ch);
+            }
+        }
+    })
+}
+
+/// Currently-focused portal-ui widget region id (process-global).
+/// Returns `None` when no portal-ui widget owns focus.
+pub fn current_focused_region() -> Option<String> {
+    focused_region().lock().unwrap().clone()
+}
+
+/// Mark `region_id` as the focused portal-ui widget. Pass `None` to
+/// clear focus. Widgets normally don't call this directly; the
+/// [`PortalUi`] helpers wrap it.
+pub fn set_focused_region(region_id: Option<String>) {
+    *focused_region().lock().unwrap() = region_id;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -214,6 +381,17 @@ impl Portal {
         sweep_stale_clicks();
         let interaction = kit.interaction();
 
+        // Shared-cache snapshot of the keyboard capture buffers
+        // populated by `install_kbd_hook`. The first portal of a
+        // new paint frame drains the live buffers into a cache;
+        // subsequent portals in the same canvas paint pass reuse
+        // the cache so every portal sees the same key / char
+        // stream. Without this, a canvas with N portals would let
+        // the first portal eat the keys and the focused widget
+        // (rarely portal #0) would observe an empty buffer. See
+        // `take_kbd_snapshot` for the frame-edge timestamp logic.
+        let (kbd_keys_frame, kbd_chars_frame) = take_kbd_snapshot();
+
         // Push the clip frame BEFORE building the UI so every
         // primitive a widget emits (and any free-form `allocate_painter`
         // draw) is bound to the portal rect. Without this, a too-wide
@@ -260,6 +438,8 @@ impl Portal {
                 // Reset every frame so the same call-site sequence
                 // produces the same WidgetId across frames.
                 call_counter: 0,
+                kbd_keys_frame: &kbd_keys_frame,
+                kbd_chars_frame: &kbd_chars_frame,
             };
             ui_closure(&mut ui);
             final_cursor_y.set(ui.cursor.y);
@@ -510,12 +690,58 @@ pub struct PortalUi<'a> {
     /// as the closure issues widget calls in the same order; for
     /// loops / conditionals, use [`Self::push_id`] / a caller key.
     pub(crate) call_counter: u32,
+    /// Per-frame snapshot of `KEY_DOWN` events captured by
+    /// [`install_kbd_hook`]. The focused widget (if any) drains these
+    /// as it processes input; widgets without focus ignore the
+    /// snapshot. Both empty if no keyboard hook was installed.
+    pub(crate) kbd_keys_frame: &'a [KbdKey],
+    pub(crate) kbd_chars_frame: &'a [char],
 }
 
 impl<'a> PortalUi<'a> {
     /// Active style (clone-cheap; widgets read this each call).
     pub fn style(&self) -> &PortalStyle {
         self.style
+    }
+
+    /// Per-frame snapshot of typed characters captured by
+    /// [`install_kbd_hook`]. Returns an empty slice if no keyboard
+    /// hook was installed or no chars were typed this frame.
+    pub fn chars_typed(&self) -> &[char] {
+        self.kbd_chars_frame
+    }
+
+    /// Per-frame snapshot of `KEY_DOWN` events captured by
+    /// [`install_kbd_hook`]. Use for non-text keys (Backspace,
+    /// Enter, arrows, Escape, etc.) — text editable widgets read
+    /// this in addition to `chars_typed`.
+    pub fn keys_pressed(&self) -> &[KbdKey] {
+        self.kbd_keys_frame
+    }
+
+    /// Mark `widget_id` as the focused portal-ui widget (globally
+    /// across all portals). Convenience wrapper over
+    /// [`set_focused_region`] that derives the region id from the
+    /// portal's id + widget id. Subsequent frames see this widget
+    /// as the focus owner; chars / keys are routed to it.
+    pub fn set_focus(&self, widget_id: WidgetId) {
+        set_focused_region(Some(widget_id.to_region_id(self.portal_id)));
+    }
+
+    /// Clear the global focus. Use when a widget releases focus
+    /// (Escape pressed, click landed elsewhere, etc.).
+    pub fn clear_focus(&self) {
+        set_focused_region(None);
+    }
+
+    /// True when `widget_id` is the currently-focused portal-ui
+    /// widget — used by text-editable widgets to decide whether to
+    /// consume `chars_typed` / `keys_pressed`.
+    pub fn is_focused(&self, widget_id: WidgetId) -> bool {
+        match current_focused_region() {
+            Some(r) => r == widget_id.to_region_id(self.portal_id),
+            None => false,
+        }
     }
 
     /// Portal clock — monotonic seconds since the portal was created.
@@ -654,6 +880,22 @@ impl<'a> PortalUi<'a> {
         self.allocate_painter(size, Sense::None).0
     }
 
+    /// `allocate_painter` with a pre-computed [`WidgetId`]. Used by
+    /// widgets that need to read / write storage state keyed off the
+    /// widget id BEFORE painting (text_input reads its caret offset,
+    /// processes typed chars, writes the new caret back, then paints).
+    /// The caller is responsible for advancing the call counter
+    /// (via [`Self::make_widget_id`]) so consecutive widgets at the
+    /// same call site still get distinct ids.
+    pub fn allocate_painter_for_id(
+        &mut self,
+        size: (f32, f32),
+        sense: Sense,
+        widget_id: WidgetId,
+    ) -> (PortalPainter<'_>, Response) {
+        self.allocate_painter_internal(size, sense, widget_id)
+    }
+
     /// `allocate_painter` with an explicit caller key. Useful when
     /// two widgets at the same call site need distinct ids (e.g. a
     /// row of buttons inside a `for` loop).
@@ -662,6 +904,16 @@ impl<'a> PortalUi<'a> {
         size: (f32, f32),
         sense: Sense,
         caller_key: Option<&str>,
+    ) -> (PortalPainter<'_>, Response) {
+        let widget_id = self.make_widget_id(caller_key);
+        self.allocate_painter_internal(size, sense, widget_id)
+    }
+
+    fn allocate_painter_internal(
+        &mut self,
+        size: (f32, f32),
+        sense: Sense,
+        widget_id: WidgetId,
     ) -> (PortalPainter<'_>, Response) {
         let rect = Rect::new(self.cursor.x, self.cursor.y, size.0, size.1);
         // Advance the cursor for the next widget.
@@ -675,12 +927,11 @@ impl<'a> PortalUi<'a> {
             }
         }
 
-        // Build a response from the kit's interaction state.
-        let widget_id = self.make_widget_id(caller_key);
         let region_id = widget_id.to_region_id(self.portal_id);
 
         let mut response = Response::empty();
         response.rect = rect;
+        response.widget_id = widget_id;
 
         match sense {
             Sense::None => {
@@ -749,6 +1000,7 @@ impl<'a> PortalUi<'a> {
                     pointer_world,
                     drag_delta_local,
                 );
+                response.widget_id = widget_id;
             }
         }
 

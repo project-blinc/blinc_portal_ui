@@ -22,6 +22,126 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+/// Re-export so callers can pick a widget shadow without `use
+/// blinc_theme::tokens::ShadowToken` boilerplate.
+pub use blinc_theme::tokens::ShadowToken;
+
+/// Centralises the `.shadow(token)` + `.shadow_sm()` / `.shadow_md()`
+/// / `.shadow_lg()` / `.shadow_xl()` / `.shadow_2xl()` /
+/// `.shadow_inner()` / `.shadow_default()` / `.shadow_none()` fluent
+/// surface every widget builder exposes. Implementors only have to
+/// override `shadow(token)`; the typed shortcuts default to forward
+/// into it.
+///
+/// Resolution at paint time mirrors the contract documented on
+/// `ButtonBuilder`: disabled state always wins (empty stack), then
+/// an explicit `Some(token)` resolves via
+/// `ThemeState::get().shadows().get(token)`, then falls back to the
+/// widget's per-variant default (`ShadowToken::None` for the
+/// non-button widgets today — they paint flat per cn parity).
+pub trait ShadowMix: Sized {
+    fn shadow(self, token: ShadowToken) -> Self;
+    fn shadow_sm(self) -> Self {
+        self.shadow(ShadowToken::Sm)
+    }
+    fn shadow_default(self) -> Self {
+        self.shadow(ShadowToken::Default)
+    }
+    fn shadow_md(self) -> Self {
+        self.shadow(ShadowToken::Md)
+    }
+    fn shadow_lg(self) -> Self {
+        self.shadow(ShadowToken::Lg)
+    }
+    fn shadow_xl(self) -> Self {
+        self.shadow(ShadowToken::Xl)
+    }
+    fn shadow_2xl(self) -> Self {
+        self.shadow(ShadowToken::Xxl)
+    }
+    fn shadow_inner(self) -> Self {
+        self.shadow(ShadowToken::Inner)
+    }
+    fn shadow_none(self) -> Self {
+        self.shadow(ShadowToken::None)
+    }
+}
+
+/// Sealed entry-point trait used by widget builders that own a value
+/// (Switch, Slider, TextInput). Implemented for both `&mut T` and
+/// `&Signal<T>` so a single `ui.switch(...)` / `ui.slider(...)` /
+/// `ui.text_input(...)` accepts either; the builder reads / writes
+/// the bound source through the resulting [`ValueBinding`].
+///
+/// The "sealed" status is enforced by keeping `BindToken` private —
+/// out-of-crate types can't accidentally satisfy the trait, which
+/// prevents the `&mut Signal<T>` ambiguity the workflow design
+/// flagged.
+mod sealed {
+    pub struct BindToken;
+}
+
+/// Carrier that the value-bearing widget builders read + write
+/// through. Two variants — borrowed-mut for caller-owned state and
+/// signal-bound for cross-portal reactive state.
+pub enum ValueBinding<'b, T: 'b> {
+    Mut(&'b mut T),
+    Signal(&'b blinc_core::reactive::Signal<T>),
+}
+
+impl<'b, T: Clone + Send + Sync + 'static> ValueBinding<'b, T> {
+    /// Read the current value. Cheap for `Mut` (clone of `T`); for
+    /// `Signal` this also subscribes the portal for reactive
+    /// re-paint when any external writer mutates the signal.
+    pub fn get(&self) -> T
+    where
+        T: Default,
+    {
+        match self {
+            ValueBinding::Mut(v) => (*v).clone(),
+            ValueBinding::Signal(sig) => sig.get(),
+        }
+    }
+
+    /// Write a new value back through the binding. For `Mut` this
+    /// writes in place; for `Signal` it goes through `Signal::set`
+    /// which fires the dirty bit for downstream subscribers.
+    pub fn set(&mut self, new: T) {
+        match self {
+            ValueBinding::Mut(v) => **v = new,
+            ValueBinding::Signal(sig) => sig.set(new),
+        }
+    }
+}
+
+/// Conversion trait for the value-bearing builders' entry points.
+/// Single inherent method per widget on `PortalUi`:
+///
+///     pub fn switch<'b, V: PortalValue<'b, bool>>(&'b mut self, v: V)
+///         -> SwitchBuilder<'a, 'b>
+///
+/// works with both `&mut bool` and `&Signal<bool>` callers, no
+/// `switch_signal` overload needed. The deprecated `*_signal`
+/// methods still exist as one-line shims for source compat.
+#[allow(private_bounds)]
+pub trait PortalValue<'b, T: 'b> {
+    #[doc(hidden)]
+    const _SEAL: sealed::BindToken = sealed::BindToken;
+    fn into_binding(self) -> ValueBinding<'b, T>;
+}
+
+impl<'b, T: 'b> PortalValue<'b, T> for &'b mut T {
+    fn into_binding(self) -> ValueBinding<'b, T> {
+        ValueBinding::Mut(self)
+    }
+}
+
+impl<'b, T: 'b> PortalValue<'b, T> for &'b blinc_core::reactive::Signal<T> {
+    fn into_binding(self) -> ValueBinding<'b, T> {
+        ValueBinding::Signal(self)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Ids
 // ─────────────────────────────────────────────────────────────────────
@@ -52,7 +172,7 @@ impl PortalId {
 /// order. Used both as a [`PortalStorage`] key (so a slider keeps its
 /// drag offset between frames) and as the suffix on the hit-region id
 /// registered with the canvas kit.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Default)]
 pub struct WidgetId(pub u64);
 
 impl WidgetId {
@@ -109,6 +229,13 @@ pub struct Response {
     /// Zero when `pressed` is false. Sliders consume this to advance
     /// the value; painters consume it for free-form draw strokes.
     pub drag_delta_local: Point,
+    /// Stable widget id assigned by [`PortalUi::allocate_painter`].
+    /// Widgets that need to set / check focus (text_input, future
+    /// number input) read this without having to call
+    /// `make_widget_id` themselves (which would bump the per-frame
+    /// call counter and shift every later widget's id). Defaults to
+    /// `WidgetId::default()` on `Response::empty()`.
+    pub widget_id: WidgetId,
 }
 
 impl Response {
@@ -125,6 +252,7 @@ impl Response {
             animating: false,
             pointer_local: None,
             drag_delta_local: Point::new(0.0, 0.0),
+            widget_id: WidgetId::default(),
         }
     }
 
@@ -258,12 +386,161 @@ impl PortalStorage {
 // Style — theme-derived constants for built-in widgets
 // ─────────────────────────────────────────────────────────────────────
 
+/// Which visual treatment a [`Button`](crate::widget) should paint.
+///
+/// Naming mirrors `blinc_cn::ButtonVariant` exactly so the two crates
+/// share one vocabulary. Each variant is resolved into a
+/// [`ButtonPalette`] at theme-load time (see
+/// [`PortalStyle::from_active_theme`]).
+///
+/// The portal-widget DEFAULT is [`ButtonVariant::Ghost`], not
+/// `Primary`. cn::button defaults to `Primary` because cn buttons
+/// live in chrome (toolbars, dialogs) where a saturated accent fill
+/// is the standard CTA look. portal_ui buttons live inside node
+/// content slots where a Primary fill would dominate the canvas;
+/// `Ghost` is the right inline default. Use `.primary()` explicitly
+/// to opt into the saturated treatment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ButtonVariant {
+    /// Filled accent fill, inverse text. cn::ButtonVariant::Primary
+    /// parity. Use for the bold call-to-action.
+    Primary,
+    /// Secondary brand fill — alternate action paired with a Primary.
+    /// cn::ButtonVariant::Secondary parity.
+    Secondary,
+    /// Error-tinted fill for destructive / irreversible actions.
+    /// cn::ButtonVariant::Destructive parity.
+    Destructive,
+    /// Transparent fill with a 1px border. cn::ButtonVariant::Outline
+    /// parity.
+    Outline,
+    /// Transparent fill, text-primary glyph. Hovers / presses with a
+    /// low-alpha text-over-bg wash. portal_ui's DEFAULT when no
+    /// variant is selected.
+    #[default]
+    Ghost,
+    /// Text-coloured, no chrome. cn::ButtonVariant::Link parity.
+    Link,
+}
+
+/// Pre-resolved colour set for one [`ButtonVariant`] in one state.
+///
+/// Populated once per frame inside [`PortalStyle::from_active_theme`]
+/// by reading [`blinc_theme::tokens::ColorToken`]s; widgets paint by
+/// switching on `idle / hover / pressed / text / border` without
+/// further token reads. Disabled state lives outside the per-variant
+/// table — see [`ButtonPalettes::disabled`].
+#[derive(Clone, Copy, Debug)]
+pub struct ButtonPalette {
+    pub idle: Color,
+    pub hover: Color,
+    pub pressed: Color,
+    pub text: Color,
+    /// `Some` only for variants that paint a border (Outline today,
+    /// future Toggled / Selected states). Variants with `border:
+    /// None` skip the border stroke.
+    pub border: Option<Color>,
+}
+
+/// One [`ButtonPalette`] per [`ButtonVariant`], plus a single
+/// `disabled` palette shared across variants. Mirrors
+/// `cn::ButtonVariant::background / foreground / border` resolution
+/// so portal_ui and cn paint identical pixels for the same variant +
+/// state.
+#[derive(Clone, Debug)]
+pub struct ButtonPalettes {
+    pub primary: ButtonPalette,
+    pub secondary: ButtonPalette,
+    pub destructive: ButtonPalette,
+    pub outline: ButtonPalette,
+    pub ghost: ButtonPalette,
+    pub link: ButtonPalette,
+    /// Cross-variant disabled look — cn::button collapses every
+    /// variant's disabled treatment to a single (InputBgDisabled,
+    /// TextTertiary, BorderSecondary) triple. portal_ui follows
+    /// suit so a disabled button looks identical regardless of its
+    /// pre-disable variant.
+    pub disabled: ButtonPalette,
+}
+
+impl ButtonPalettes {
+    /// Look up the palette for a given variant (excluding the
+    /// cross-cutting `disabled` state — that is read directly via
+    /// `self.disabled`).
+    pub fn for_variant(&self, v: ButtonVariant) -> &ButtonPalette {
+        match v {
+            ButtonVariant::Primary => &self.primary,
+            ButtonVariant::Secondary => &self.secondary,
+            ButtonVariant::Destructive => &self.destructive,
+            ButtonVariant::Outline => &self.outline,
+            ButtonVariant::Ghost => &self.ghost,
+            ButtonVariant::Link => &self.link,
+        }
+    }
+}
+
+/// Pre-resolved shadow stacks per [`ButtonVariant`], plus a shared
+/// `disabled` slot. Mirrors [`ButtonPalettes`] so token resolution
+/// happens once per frame in
+/// [`PortalStyle::from_active_theme`] and widgets pay only a slice
+/// read at paint time.
+///
+/// Each slot stores `Vec<blinc_core::layer::Shadow>` — already
+/// lowered from the theme's `blinc_theme::Shadow` so the painter
+/// can hand them to `DrawContext::draw_shadow` directly without
+/// re-conversion.
+#[derive(Clone, Debug)]
+pub struct ButtonShadows {
+    pub primary: Vec<blinc_core::layer::Shadow>,
+    pub secondary: Vec<blinc_core::layer::Shadow>,
+    pub destructive: Vec<blinc_core::layer::Shadow>,
+    pub outline: Vec<blinc_core::layer::Shadow>,
+    pub ghost: Vec<blinc_core::layer::Shadow>,
+    pub link: Vec<blinc_core::layer::Shadow>,
+    /// Cross-variant disabled shadow — always empty (cn::button
+    /// parity: disabled buttons render flat).
+    pub disabled: Vec<blinc_core::layer::Shadow>,
+}
+
+impl ButtonShadows {
+    pub fn for_variant(&self, v: ButtonVariant) -> &[blinc_core::layer::Shadow] {
+        match v {
+            ButtonVariant::Primary => &self.primary,
+            ButtonVariant::Secondary => &self.secondary,
+            ButtonVariant::Destructive => &self.destructive,
+            ButtonVariant::Outline => &self.outline,
+            ButtonVariant::Ghost => &self.ghost,
+            ButtonVariant::Link => &self.link,
+        }
+    }
+}
+
 /// Theme-derived visual constants the built-in widgets read from.
 ///
 /// Hosts construct one from the active theme each frame (cheap — just
 /// reads from theme tokens). Custom widgets can ignore `PortalStyle`
 /// entirely and read theme tokens directly via
 /// [`blinc_theme::ThemeState::get`].
+///
+/// ## Token-discipline policy
+///
+/// Every colour field on `PortalStyle` traces back to a single
+/// [`ColorToken`](blinc_theme::tokens::ColorToken) read in
+/// [`Self::from_active_theme`]. The few derived values
+/// (`accent_pressed`, the destructive hover/pressed shades) are
+/// algorithmic shifts on a token value, not freestanding literals
+/// — calling out the known token gaps cn::button papers over:
+///
+/// - No `ErrorHover` / `ErrorActive` tokens — destructive hover /
+///   pressed are `darken(Error, 0.10 / 0.15)`. Matches cn exactly.
+/// - No overlay-alpha token — ghost / outline hover/pressed apply
+///   alpha 0.05 / 0.10 on `TextPrimary`. Same magic alphas as cn.
+/// - No `DisabledText` / `DisabledBorder` for non-input variants —
+///   disabled buttons resolve to `(InputBgDisabled, TextTertiary,
+///   BorderSecondary)` to stay aligned with cn.
+///
+/// Don't introduce parallel `ColorToken` entries for derived shades;
+/// the algorithmic form is the cross-crate contract.
 #[derive(Clone, Debug)]
 pub struct PortalStyle {
     pub font_size: f32,
@@ -279,9 +556,29 @@ pub struct PortalStyle {
 
     pub background: Color,
 
+    /// Per-variant button palettes. The recommended access path is
+    /// [`Self::buttons`].`for_variant(...)`; the legacy flat fields
+    /// (`button_bg`, `button_hover`, `button_pressed`, `button_text`)
+    /// continue to mirror the `Ghost` variant for source-compat with
+    /// custom widgets that read them directly.
+    pub buttons: ButtonPalettes,
+    /// Per-variant shadow stacks. Resolved once per frame from
+    /// `ThemeState::get().shadows()` so widgets only pay a slice
+    /// borrow at paint time. cn::button parity: Primary / Secondary /
+    /// Destructive default to `ShadowToken::Md`, Outline to
+    /// `ShadowToken::Sm`, Ghost / Link / disabled to none.
+    pub buttons_shadow: ButtonShadows,
+
+    /// Deprecated — alias for `buttons.ghost.idle`. Kept for one
+    /// release so custom widgets that read this field don't break.
+    /// New code should call `style.buttons.for_variant(variant).idle`.
+    #[doc(hidden)]
     pub button_bg: Color,
+    #[doc(hidden)]
     pub button_hover: Color,
+    #[doc(hidden)]
     pub button_pressed: Color,
+    #[doc(hidden)]
     pub button_text: Color,
 
     pub field_bg: Color,
@@ -314,14 +611,110 @@ impl PortalStyle {
         let text_primary = c(ColorToken::TextPrimary);
         let accent = c(ColorToken::Accent);
 
-        // 18 % text-over-bg is the contrast sweet spot: visible on
-        // every inset shade we paint widgets over (white-ish through
-        // near-black) without competing with the accent-filled
-        // portion of a slider or the thumb glyph.
+        // 18 % text-over-bg is the contrast sweet spot for the slider
+        // track: visible on every inset shade we paint widgets over
+        // (white-ish through near-black) without competing with the
+        // accent-filled portion of a slider or the thumb glyph.
         let track_alpha = 0.18_f32;
-        let button_bg_alpha = 0.08_f32;
-        let button_hover_alpha = 0.14_f32;
-        let button_pressed_alpha = 0.20_f32;
+        // Ghost / Outline hover and pressed apply 5% / 10% text-over-
+        // surface alphas — same magic numbers cn::button uses for the
+        // equivalent variants. No theme token for the subtle-alpha
+        // constant; the cross-crate agreement is the contract.
+        let overlay_hover_alpha = 0.05_f32;
+        let overlay_pressed_alpha = 0.10_f32;
+
+        let error = c(ColorToken::Error);
+        let primary = c(ColorToken::Primary);
+        let primary_hover = c(ColorToken::PrimaryHover);
+        let primary_active = c(ColorToken::PrimaryActive);
+        let secondary = c(ColorToken::Secondary);
+        let secondary_hover = c(ColorToken::SecondaryHover);
+        let secondary_active = c(ColorToken::SecondaryActive);
+        let text_inverse = c(ColorToken::TextInverse);
+        let border = c(ColorToken::Border);
+        let border_secondary = c(ColorToken::BorderSecondary);
+        let text_tertiary = c(ColorToken::TextTertiary);
+        let input_bg_disabled = c(ColorToken::InputBgDisabled);
+        let transparent = Color::rgba(0.0, 0.0, 0.0, 0.0);
+
+        // Pre-resolve per-variant shadow stacks. ThemeState::shadows
+        // returns an owned ShadowTokens (clone of the RwLock-guarded
+        // inner value); bind to a local so the slice borrows we take
+        // off `.get(...)` outlive the temporary. Lower each
+        // blinc_theme::Shadow into a blinc_core::layer::Shadow once
+        // here so the painter doesn't re-convert per frame.
+        let theme_shadows = blinc_theme::ThemeState::get().shadows();
+        let lower_stack = |stack: &[blinc_theme::tokens::Shadow]| -> Vec<blinc_core::layer::Shadow> {
+            stack.iter().map(|s| blinc_core::layer::Shadow::from(s.clone())).collect()
+        };
+        let buttons_shadow = ButtonShadows {
+            primary: lower_stack(theme_shadows.get(ShadowToken::Md)),
+            secondary: lower_stack(theme_shadows.get(ShadowToken::Md)),
+            destructive: lower_stack(theme_shadows.get(ShadowToken::Md)),
+            outline: lower_stack(theme_shadows.get(ShadowToken::Sm)),
+            ghost: Vec::new(),
+            link: Vec::new(),
+            // Disabled buttons render flat regardless of pre-disable
+            // variant — cn::button parity.
+            disabled: Vec::new(),
+        };
+
+        // MIRROR cn::ButtonVariant::background / foreground / border.
+        // Any change to the destructive darken factors (0.10 / 0.15)
+        // or the overlay alphas (0.05 / 0.10) MUST be reflected in
+        // cn::button — and vice versa. The two crates paint the
+        // exact same pixels for the same variant + state.
+        let buttons = ButtonPalettes {
+            primary: ButtonPalette {
+                idle: primary,
+                hover: primary_hover,
+                pressed: primary_active,
+                text: text_inverse,
+                border: None,
+            },
+            secondary: ButtonPalette {
+                idle: secondary,
+                hover: secondary_hover,
+                pressed: secondary_active,
+                text: text_inverse,
+                border: None,
+            },
+            destructive: ButtonPalette {
+                idle: error,
+                hover: darken(error, 0.10),
+                pressed: darken(error, 0.15),
+                text: text_inverse,
+                border: None,
+            },
+            outline: ButtonPalette {
+                idle: transparent,
+                hover: text_primary.with_alpha(overlay_hover_alpha),
+                pressed: text_primary.with_alpha(overlay_pressed_alpha),
+                text: text_primary,
+                border: Some(border),
+            },
+            ghost: ButtonPalette {
+                idle: transparent,
+                hover: text_primary.with_alpha(overlay_hover_alpha),
+                pressed: text_primary.with_alpha(overlay_pressed_alpha),
+                text: text_primary,
+                border: None,
+            },
+            link: ButtonPalette {
+                idle: transparent,
+                hover: transparent,
+                pressed: transparent,
+                text: primary,
+                border: None,
+            },
+            disabled: ButtonPalette {
+                idle: input_bg_disabled,
+                hover: input_bg_disabled,
+                pressed: input_bg_disabled,
+                text: text_tertiary,
+                border: Some(border_secondary),
+            },
+        };
 
         Self {
             font_size: 12.0,
@@ -332,14 +725,19 @@ impl PortalStyle {
             indent: 14.0,
             text_primary,
             text_secondary: c(ColorToken::TextSecondary),
-            text_disabled: c(ColorToken::TextTertiary),
+            text_disabled: text_tertiary,
             background: c(ColorToken::SurfaceElevated),
-            button_bg: text_primary.with_alpha(button_bg_alpha),
-            button_hover: text_primary.with_alpha(button_hover_alpha),
-            button_pressed: text_primary.with_alpha(button_pressed_alpha),
-            button_text: text_primary,
+            // Legacy flat fields mirror the Ghost variant so custom
+            // widgets that read them directly keep painting the same
+            // muted text-over-alpha treatment they always did.
+            button_bg: buttons.ghost.idle,
+            button_hover: buttons.ghost.hover,
+            button_pressed: buttons.ghost.pressed,
+            button_text: buttons.ghost.text,
+            buttons,
+            buttons_shadow,
             field_bg: c(ColorToken::InputBg),
-            field_border: c(ColorToken::Border),
+            field_border: border,
             field_border_focus: c(ColorToken::BorderFocus),
             track: text_primary.with_alpha(track_alpha),
             track_filled: accent,
