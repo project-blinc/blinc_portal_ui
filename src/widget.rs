@@ -68,19 +68,28 @@ fn text_style(style: &PortalStyle, color: Color) -> TextStyle {
 impl<'a> PortalUi<'a> {
     /// Static text. Does not register a hit region. Returns the rect
     /// it allocated so callers can chain layout decisions on it.
+    ///
+    /// Row-aware vertical sizing: in a horizontal layout the rect
+    /// allocates `control_height` so the label vertically centres
+    /// against sibling widgets (switch / numeric_input / slider /
+    /// select / button), which all allocate the same height. In
+    /// vertical layout the rect stays at `line_height` for compact
+    /// stacking. The text origin lands at the rect's vertical
+    /// midpoint either way.
     pub fn label(&mut self, text: &str) -> Response {
         let style = self.style.clone();
         let width = approx_text_width(text, &style).max(1.0);
-        let height = style.line_height;
+        let in_row = self.layout == crate::ui::LayoutDirection::Horizontal;
+        let height = if in_row {
+            style.control_height
+        } else {
+            style.line_height
+        };
         let (mut p, resp) = self.allocate_painter((width, height), Sense::None);
-        let color = style.text_primary;
-        let mut ts = text_style(&style, color);
-        // Baseline-down: position so the alphabetic baseline sits
-        // near the bottom of the rect.
-        ts.baseline = TextBaseline::Alphabetic;
-        let origin = Point::new(p.rect().x(), p.rect().y() + style.font_size);
+        let mut ts = text_style(&style, style.text_primary);
+        ts.baseline = TextBaseline::Middle;
+        let origin = Point::new(p.rect().x(), p.rect().y() + height * 0.5);
         p.draw_text(text, &ts, origin);
-        let _ = color; // silence linter; baked into ts above
         resp
     }
 
