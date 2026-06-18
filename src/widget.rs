@@ -886,12 +886,30 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
             shadow_token,
         } = self;
         let style = ui.style.clone();
-        let (avail_w, _) = ui.available_size();
-        let width = width_override.unwrap_or_else(|| avail_w.clamp(72.0, 240.0));
         let height = style.control_height;
 
         let widget_id = ui.make_widget_id(None);
         let portal_id = ui.portal_id;
+
+        // Width: 3-character floor so a single-digit value still
+        // reads as a clearly editable field. When `.width(...)` is
+        // set, it's still clamped UP to the 3-char floor — passing
+        // a too-narrow override doesn't crush the chip.
+        let three_char_w = text_width("000", &style) + 16.0;
+        let unit_w = unit
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(|u| text_width(u, &style) + 4.0)
+            .unwrap_or(0.0);
+        let content_w = text_width(
+            &format_numeric(value.get(), precision, integer),
+            &style,
+        ) + unit_w
+            + 16.0;
+        let width = match width_override {
+            Some(w) => w.max(three_char_w),
+            None => content_w.max(three_char_w),
+        };
 
         // Phase 1: snapshot current state + bound value.
         let current_raw = value.get();
