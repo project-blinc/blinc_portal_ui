@@ -14,20 +14,22 @@
 //! frame-to-frame continuity needs. Built-in widgets ([`widget`] module)
 //! consume all three; custom widgets can ignore any of them.
 
+pub mod color_wheel;
 pub mod core;
 pub mod painter;
 pub mod signal;
 pub mod ui;
 pub mod widget;
 
+pub use crate::color_wheel::color_wheel_panel;
 pub use crate::core::{
     ButtonPalette, ButtonPalettes, ButtonShadows, ButtonVariant, HostBridge, PortalId,
     PortalStorage, PortalStyle, PortalValue, Response, Sense, ShadowMix, ShadowToken,
     ValueBinding, WidgetId,
 };
 pub use crate::widget::{
-    ButtonBuilder, NumericInputBuilder, SelectBuilder, SliderBuilder, SwitchBuilder,
-    TextInputBuilder,
+    ButtonBuilder, ColorPickerBuilder, NumericInputBuilder, SelectBuilder, SliderBuilder,
+    SwitchBuilder, TextInputBuilder,
 };
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;

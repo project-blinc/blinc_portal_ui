@@ -1679,6 +1679,183 @@ fn next_char_boundary(s: &str, offset: usize) -> usize {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// color_picker — hex-bound trigger chip with an inline preview swatch
+// and the hex string label. Same overlay-escape contract as
+// `select_trigger`: the widget paints the chip and reports clicks; the
+// host opens the wheel popover anchored to `Response::rect` and writes
+// the picked hex back into the bound value (typically a
+// `Signal<String>`). The host-side popover content is built via
+// [`crate::color_wheel_panel`] which returns a `Div` ready to drop
+// into `OverlayBuilder::popover().content(...)`.
+// ─────────────────────────────────────────────────────────────────────
+
+#[must_use = "ColorPickerBuilder is lazy — call .show() / .clicked() to paint"]
+pub struct ColorPickerBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, String>,
+    width_override: Option<f32>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for ColorPickerBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> ColorPickerBuilder<'a, 'b> {
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+
+    pub fn show(self) -> Response {
+        let ColorPickerBuilder {
+            ui,
+            value,
+            width_override,
+            disabled,
+            shadow_token,
+        } = self;
+        let style = ui.style.clone();
+        let height = style.control_height;
+        let hex = value.get();
+        // Width: hex label + swatch + padding. 6-digit hex is the
+        // common case so we size around `#ffffff` worst case (7 chars
+        // including hash). Wider when the bound value is the 8-digit
+        // alpha-included form.
+        let hex_w = text_width(&hex, &style).max(text_width("#ffffff", &style));
+        let swatch_size = (height - 8.0).max(12.0);
+        let default_w = swatch_size + 6.0 + hex_w + 22.0;
+        let width = width_override.unwrap_or(default_w);
+
+        let sense = if disabled { Sense::Hover } else { Sense::Click };
+        let (mut p, mut resp) = ui.allocate_painter((width, height), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+
+        let bg = if disabled {
+            style.field_bg.with_alpha(0.5)
+        } else if resp.pressed {
+            style.button_pressed
+        } else if resp.hovered {
+            style.button_hover
+        } else {
+            style.field_bg
+        };
+        let border = if resp.hovered && !disabled {
+            style.field_border_focus
+        } else {
+            style.field_border
+        };
+        p.fill_self(&style, Brush::Solid(bg));
+        p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
+
+        // Swatch — left-anchored, vertically centred. Parses the
+        // bound hex; falls back to `field_bg` when the string isn't a
+        // valid colour so the chip never goes blank on a typo.
+        let swatch_x = p.rect().x() + 6.0;
+        let swatch_y = p.rect().y() + (height - swatch_size) * 0.5;
+        let swatch_rect =
+            blinc_core::layer::Rect::new(swatch_x, swatch_y, swatch_size, swatch_size);
+        let swatch_color = Color::from_hex_str(&hex).unwrap_or(style.field_bg);
+        let swatch_radius = blinc_core::layer::CornerRadius::uniform(3.0);
+        p.fill_rect(swatch_rect, swatch_radius, Brush::Solid(swatch_color));
+        p.stroke_rect(
+            swatch_rect,
+            swatch_radius,
+            &Stroke::new(1.0),
+            Brush::Solid(style.field_border),
+        );
+
+        // Hex label.
+        let label_color = if disabled {
+            style.text_disabled
+        } else {
+            style.text_primary
+        };
+        let mut ts = text_style(&style, label_color);
+        ts.baseline = TextBaseline::Middle;
+        let label_x = swatch_x + swatch_size + 6.0;
+        let label_y = p.rect().y() + height * 0.5;
+        if !hex.is_empty() {
+            p.draw_text(&hex, &ts, Point::new(label_x, label_y));
+        }
+
+        // Chevron — same shape as select_trigger so the affordance
+        // reads as "press to open menu" across both widgets.
+        let chev_cx = p.rect().x() + p.rect().width() - 12.0;
+        let chev_cy = p.rect().y() + p.rect().height() * 0.5;
+        let chev_half_w = 4.0_f32;
+        let chev_half_h = 2.5_f32;
+        let chev_path = blinc_core::draw::Path::new()
+            .move_to(chev_cx - chev_half_w, chev_cy - chev_half_h)
+            .line_to(chev_cx, chev_cy + chev_half_h)
+            .line_to(chev_cx + chev_half_w, chev_cy - chev_half_h);
+        let chev_color = if disabled {
+            style.text_disabled
+        } else {
+            style.text_secondary
+        };
+        p.stroke_path(&chev_path, &Stroke::new(1.5), Brush::Solid(chev_color));
+
+        if disabled {
+            resp.clicked = false;
+            resp.pressed = false;
+        }
+        resp
+    }
+
+    pub fn clicked(self) -> bool {
+        self.show().clicked
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Paint a colour-picker trigger chip bound to a hex
+    /// `String`. The chip shows a small swatch at the bound colour, the
+    /// canonical hex label, and a chevron. Returns a
+    /// [`ColorPickerBuilder`]; chain `.disabled(...)` / `.width(...)` /
+    /// `.shadow_*()` and terminate with `.show()` (full Response) or
+    /// `.clicked()` (`bool`).
+    ///
+    /// The host opens the wheel popover when `resp.clicked` is true by
+    /// anchoring against `resp.rect` through
+    /// [`crate::core::HostBridge::rect_to_screen`] and mounting
+    /// [`crate::color_wheel_panel(bound_signal)`] as the overlay's
+    /// content. The widget never reaches into the overlay manager
+    /// itself — same contract as [`Self::select_trigger`].
+    pub fn color_picker<'b, V: PortalValue<'b, String>>(
+        &'b mut self,
+        value: V,
+    ) -> ColorPickerBuilder<'a, 'b> {
+        ColorPickerBuilder {
+            ui: self,
+            value: value.into_binding(),
+            width_override: None,
+            disabled: false,
+            shadow_token: None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // select_trigger — dropdown chip rendered as a button-styled field.
 // The widget paints the trigger and reports clicks; opening the
 // menu is the host's job (overlay-escape contract per the README's
