@@ -1731,8 +1731,10 @@ impl<'a, 'b> ColorPickerBuilder<'a, 'b> {
         // including hash). Wider when the bound value is the 8-digit
         // alpha-included form.
         let hex_w = text_width(&hex, &style).max(text_width("#ffffff", &style));
+        // 4 px grid: swatch padding 4 px, swatch→label gap 4 px,
+        // label→right-edge gap 12 px (3 units of breathing room).
         let swatch_size = (height - 8.0).max(12.0);
-        let default_w = swatch_size + 6.0 + hex_w + 12.0;
+        let default_w = swatch_size + 4.0 + hex_w + 12.0;
         let width = width_override.unwrap_or(default_w);
 
         let sense = if disabled { Sense::Hover } else { Sense::Click };
@@ -1770,12 +1772,13 @@ impl<'a, 'b> ColorPickerBuilder<'a, 'b> {
         // Swatch — left-anchored, vertically centred. Parses the
         // bound hex; falls back to `field_bg` when the string isn't a
         // valid colour so the chip never goes blank on a typo.
-        let swatch_x = p.rect().x() + 6.0;
+        // 4 px left pad on the swatch, 4 px between swatch and label.
+        let swatch_x = p.rect().x() + 4.0;
         let swatch_y = p.rect().y() + (height - swatch_size) * 0.5;
         let swatch_rect =
             blinc_core::layer::Rect::new(swatch_x, swatch_y, swatch_size, swatch_size);
         let swatch_color = Color::from_hex_str(&hex).unwrap_or(style.field_bg);
-        let swatch_radius = blinc_core::layer::CornerRadius::uniform(3.0);
+        let swatch_radius = blinc_core::layer::CornerRadius::uniform(4.0);
         p.fill_rect(swatch_rect, swatch_radius, Brush::Solid(swatch_color));
         p.stroke_rect(
             swatch_rect,
@@ -1792,7 +1795,7 @@ impl<'a, 'b> ColorPickerBuilder<'a, 'b> {
         };
         let mut ts = text_style(&style, label_color);
         ts.baseline = TextBaseline::Middle;
-        let label_x = swatch_x + swatch_size + 6.0;
+        let label_x = swatch_x + swatch_size + 4.0;
         let label_y = p.rect().y() + height * 0.5;
         if !hex.is_empty() {
             p.draw_text(&hex, &ts, Point::new(label_x, label_y));

@@ -39,8 +39,11 @@ use blinc_core::layer::{Brush, Color, CornerRadius, Gradient, Point, Rect, Vec2}
 use blinc_core::reactive::{signal, Signal};
 use blinc_layout::{canvas, div, Div};
 
-const WHEEL_PX: f32 = 220.0;
-const RING_THICKNESS: f32 = 22.0;
+// Sizes align to a 4 px grid (1 unit = 4 px). WHEEL_PX = 56 units,
+// RING_THICKNESS = 6 units. Markers (paint helpers) are exempt —
+// circle radii follow the visual weight needed, not the layout grid.
+const WHEEL_PX: f32 = 224.0;
+const RING_THICKNESS: f32 = 24.0;
 const HUE_SEGMENTS: usize = 48;
 
 /// Build the host-side overlay panel for the colour-wheel popover.
