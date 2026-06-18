@@ -1143,29 +1143,31 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
                     Brush::Solid(style.text_primary),
                 );
             } else {
-                // Idle / scrub mode — centred text. The number is
-                // the primary affordance and the unit (if any)
-                // trails it as a single visually-balanced block:
-                // measure both, paint the number centred over
-                // `(rect.width() - unit_block_width) * 0.5` so the
-                // combined glyph row stays optically centred.
+                // Idle / scrub mode — centred text. Use the
+                // renderer's TextAlign::Center via the TextStyle
+                // (passing the centre x as the origin) rather than
+                // computing a left-edge offset by hand — the
+                // approx-glyph-advance estimate the latter relied
+                // on drifts at small char counts and reads
+                // visibly off-centre. Centre vs the chip rect
+                // minus half the unit-block so the number sits
+                // optically centred when a `.unit(...)` suffix is
+                // present.
                 let formatted = format_numeric(current, precision, integer);
-                let unit_text = unit.as_deref();
-                let unit_w = match unit_text {
-                    Some(u) if !u.is_empty() => text_width(u, &style) + 4.0,
-                    _ => 0.0,
-                };
-                let num_w = text_width(&formatted, &style);
-                let row_w = num_w + unit_w;
-                let row_x = p.rect().x() + (p.rect().width() - row_w) * 0.5;
-                p.draw_text(&formatted, &ts, Point::new(row_x, text_y));
+                let unit_text = unit.as_deref().filter(|u| !u.is_empty());
+                let unit_w = unit_text
+                    .map(|u| text_width(u, &style) + 4.0)
+                    .unwrap_or(0.0);
+                let centre_x = p.rect().x() + (p.rect().width() - unit_w) * 0.5;
+                let mut centred = ts.clone();
+                centred.align = blinc_core::TextAlign::Center;
+                p.draw_text(&formatted, &centred, Point::new(centre_x, text_y));
                 if let Some(u) = unit_text {
-                    if !u.is_empty() {
-                        let unit_x = row_x + num_w + 4.0;
-                        let mut uts = ts.clone();
-                        uts.color = style.text_disabled;
-                        p.draw_text(u, &uts, Point::new(unit_x, text_y));
-                    }
+                    let num_w_half = text_width(&formatted, &style) * 0.5;
+                    let unit_x = centre_x + num_w_half + 4.0;
+                    let mut uts = ts.clone();
+                    uts.color = style.text_disabled;
+                    p.draw_text(u, &uts, Point::new(unit_x, text_y));
                 }
             }
         } // painter dropped
@@ -1173,6 +1175,18 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
         // Phase 4: post-paint scrub + click-to-edit. Drag-scrub
         // runs only in idle mode; editing eats the drag (text
         // selection wins once that lands).
+        //
+        // SCRUB MATH. The pixel accumulator integrates per-frame
+        // drag delta; once it crosses `pixels_per_step`, that many
+        // integer step-units flush into the value and the
+        // sub-pixel remainder stays in the accumulator so slow
+        // drags still respond. `pixels_per_step` defaults to
+        // `BASE_PIXELS_PER_STEP / drag_sensitivity` — at the
+        // default sensitivity of 1.0 a single integer step costs
+        // 4 pixels of drag (one step every ~quarter inch on a
+        // typical trackpad). For continuous mode (step == 0.0) we
+        // synthesise a step from the range: range/200 so a full
+        // drag across the chip covers a reasonable spread.
         if !disabled && !state.editing {
             let pressed_now = resp_pressed;
             if pressed_now && !state.was_pressed_last_frame {
@@ -1180,21 +1194,28 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
             }
             if pressed_now && drag_delta_x.abs() > 0.0 {
                 state.drag_accum_pixels += drag_delta_x;
-                let step_per_pixel = if step > 0.0 {
-                    step * drag_sensitivity
+                let step_value = if step > 0.0 {
+                    step
                 } else {
-                    drag_sensitivity
+                    // Continuous-mode synthesised step.
+                    let span = match (min, max) {
+                        (Some(lo), Some(hi)) => (hi - lo).abs().max(1.0),
+                        _ => 1.0,
+                    };
+                    span / 200.0
                 };
-                let raw_steps = state.drag_accum_pixels * step_per_pixel
-                    / step_per_pixel.max(f32::EPSILON);
+                const BASE_PIXELS_PER_STEP: f32 = 4.0;
+                let pixels_per_step =
+                    (BASE_PIXELS_PER_STEP / drag_sensitivity.max(0.01)).max(0.5);
+                let raw_steps = state.drag_accum_pixels / pixels_per_step;
                 let integer_steps = raw_steps.trunc();
                 if integer_steps.abs() >= 1.0 {
-                    let new_val = clamp_value(current + integer_steps * step_per_pixel);
+                    let new_val = clamp_value(current + integer_steps * step_value);
                     if (new_val - current).abs() > f32::EPSILON {
                         value.set(new_val);
                         changed = true;
                     }
-                    state.drag_accum_pixels -= integer_steps;
+                    state.drag_accum_pixels -= integer_steps * pixels_per_step;
                 }
             }
             state.was_pressed_last_frame = pressed_now;
