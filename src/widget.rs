@@ -783,6 +783,12 @@ struct NumericInputState {
     /// drag-start can reset the accumulator. Without this, a
     /// new drag inherits leftover sub-pixel from the prior gesture.
     was_pressed_last_frame: bool,
+    /// Timestamp (`ui.time()` seconds, portal-monotonic) of the
+    /// most recent no-drag click. Set on each click; a second
+    /// click within `DOUBLE_CLICK_WINDOW_S` is treated as the
+    /// double-click that enters edit mode. Cleared when edit
+    /// mode is committed / cancelled.
+    last_click_time: f32,
 }
 
 #[must_use = "NumericInputBuilder is lazy — call .show() / .changed() to paint"]
@@ -1231,14 +1237,27 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
         }
 
         if !disabled && resp_clicked {
-            // Click without drag → enter edit mode. The kit's click
-            // listener only fires when `did_drag` was false, so
-            // reaching here means the user did NOT scrub.
-            state.editing = true;
-            state.scratch = format_numeric(current, precision, integer);
-            state.caret = state.scratch.len();
-            state.drag_accum_pixels = 0.0;
-            crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+            // Click semantics: SINGLE click is a no-op (the scrub
+            // affordance owns it — drag-to-scrub is the primary
+            // interaction). DOUBLE click within
+            // `DOUBLE_CLICK_WINDOW_S` enters edit mode where the
+            // user can type a value. Avoids the alignment shift
+            // single-click-to-edit produced (idle = centred,
+            // edit = left-aligned) on accidental clicks.
+            const DOUBLE_CLICK_WINDOW_S: f32 = 0.3;
+            let now = ui.time();
+            if now - state.last_click_time < DOUBLE_CLICK_WINDOW_S
+                && state.last_click_time > 0.0
+            {
+                state.editing = true;
+                state.scratch = format_numeric(current, precision, integer);
+                state.caret = state.scratch.len();
+                state.drag_accum_pixels = 0.0;
+                state.last_click_time = 0.0;
+                crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+            } else {
+                state.last_click_time = now;
+            }
         }
 
         // Persist state back to storage.
