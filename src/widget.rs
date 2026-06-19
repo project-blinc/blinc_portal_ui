@@ -674,6 +674,11 @@ pub struct ChartsBuilder<'a, 'b> {
     /// Optional unit suffix appended to the tooltip number
     /// ("ms", "px", "%").
     tooltip_unit: Option<String>,
+    /// Show a "picture-in-picture" corner icon. Click sets
+    /// `Response::pip_clicked = true` so the host can mount an
+    /// expanded view (typically in an overlay popover). Opt-in
+    /// because most sparklines are read-only.
+    pip: bool,
 }
 
 impl<'a, 'b> ShadowMix for ChartsBuilder<'a, 'b> {
@@ -779,6 +784,15 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         self.tooltip_unit = Some(u.into());
         self
     }
+    /// Enable a "picture-in-picture" corner icon. When the user
+    /// clicks it, `Response::pip_clicked` flips to `true` so the
+    /// host can mount an expanded popover (the chart never owns
+    /// the overlay — same escape-the-canvas contract every other
+    /// portal_ui widget uses). Opt-in.
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
 
     pub fn show(self) -> Response {
         use blinc_core::draw::{LineCap, LineJoin};
@@ -806,6 +820,7 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             tooltip,
             tooltip_precision,
             tooltip_unit,
+            pip,
         } = self;
 
         let style = ui.style.clone();
@@ -817,12 +832,16 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         let height = height_override.unwrap_or(80.0);
 
         let data: Vec<f32> = value.get();
-        let sense = if tooltip && !disabled {
+        // PiP icon needs click detection; tooltip needs hover.
+        // Click implies hover so PiP-enabled charts get both.
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else if tooltip && !disabled {
             Sense::Hover
         } else {
             Sense::None
         };
-        let (mut p, resp) = ui.allocate_painter((width, height), sense);
+        let (mut p, mut resp) = ui.allocate_painter((width, height), sense);
 
         if let Some(tok) = shadow_token {
             if !disabled {
@@ -1038,13 +1057,66 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             }
         }
 
+        // ─── PiP corner icon ──────────────────────────────────
+        // Top-right corner glyph that signals the host to mount an
+        // expanded view of the chart. Click handoff: transfer
+        // resp.clicked → resp.pip_clicked when the cursor sits
+        // inside the icon's local rect at click time. Suppresses
+        // the chart's tooltip in that same region so the icon and
+        // the hover crosshair don't fight for screen space.
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let icon_pad = 4.0_f32;
+                let icon_size = 16.0_f32;
+                let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
+                let iy = p.rect().y() + icon_pad;
+                lx >= ix && lx < ix + icon_size && ly >= iy && ly < iy + icon_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let icon_pad = 4.0_f32;
+            let icon_size = 16.0_f32;
+            let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
+            let iy = p.rect().y() + icon_pad;
+            let icon_color = if pointer_in_pip {
+                style.text_primary
+            } else {
+                style.text_secondary
+            };
+            // PiP frame — outline of the outer screen.
+            p.stroke_rect(
+                blinc_core::layer::Rect::new(ix + 1.0, iy + 3.0, 12.0, 9.0),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            // PiP overlay — small rect tucked in the lower-right
+            // corner of the frame, the canonical glyph.
+            p.fill_rect(
+                blinc_core::layer::Rect::new(ix + 7.0, iy + 8.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
         // ─── tooltip ──────────────────────────────────────────
         // Hover crosshair + value pill at the cursor's x. Maps the
         // cursor's local-x back into the sample index, paints a
         // 1 px crosshair line, dots the matched sample, then
         // renders a small pill near the cursor with the formatted
-        // value. Skipped when disabled / no hover / data empty.
-        if tooltip && !disabled && resp.hovered {
+        // value. Skipped when disabled / no hover / data empty /
+        // cursor over the PiP icon.
+        if tooltip && !disabled && resp.hovered && !pointer_in_pip {
             if let Some(local) = resp.pointer_local {
                 let cur_x = p.rect().x() + local.x;
                 let cur_y = p.rect().y() + local.y;
@@ -1176,6 +1248,7 @@ impl<'a> PortalUi<'a> {
             tooltip: true,
             tooltip_precision: None,
             tooltip_unit: None,
+            pip: false,
         }
     }
 }
@@ -1215,6 +1288,10 @@ pub struct PieChartBuilder<'a, 'b> {
     /// Optional unit suffix appended to the slice value in the
     /// tooltip ("ms", "px", "%").
     tooltip_unit: Option<String>,
+    /// Show a "picture-in-picture" corner icon. Click flips
+    /// `Response::pip_clicked` so the host can open an expanded
+    /// popover. Opt-in.
+    pip: bool,
 }
 
 impl<'a, 'b> ShadowMix for PieChartBuilder<'a, 'b> {
@@ -1287,6 +1364,13 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
         self.tooltip_unit = Some(u.into());
         self
     }
+    /// Enable the "picture-in-picture" corner icon. When the user
+    /// clicks it, `Response::pip_clicked` flips to `true` so the
+    /// host can open an expanded popover.
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
 
     pub fn show(self) -> Response {
         use blinc_core::layer::{CornerRadius, Rect};
@@ -1304,6 +1388,7 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             center,
             tooltip,
             tooltip_unit,
+            pip,
         } = self;
 
         let style = ui.style.clone();
@@ -1320,12 +1405,14 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
         } else {
             d
         };
-        let sense = if tooltip && !disabled {
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else if tooltip && !disabled {
             Sense::Hover
         } else {
             Sense::None
         };
-        let (mut p, resp) = ui.allocate_painter((alloc_w, d), sense);
+        let (mut p, mut resp) = ui.allocate_painter((alloc_w, d), sense);
 
         if let Some(tok) = shadow_token {
             if !disabled {
@@ -1483,6 +1570,49 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             }
         }
 
+        // ─── PiP corner icon ──────────────────────────────────
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let icon_pad = 4.0_f32;
+                let icon_size = 16.0_f32;
+                let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
+                let iy = p.rect().y() + icon_pad;
+                lx >= ix && lx < ix + icon_size && ly >= iy && ly < iy + icon_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let icon_pad = 4.0_f32;
+            let icon_size = 16.0_f32;
+            let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
+            let iy = p.rect().y() + icon_pad;
+            let icon_color = if pointer_in_pip {
+                style.text_primary
+            } else {
+                style.text_secondary
+            };
+            p.stroke_rect(
+                Rect::new(ix + 1.0, iy + 3.0, 12.0, 9.0),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            p.fill_rect(
+                Rect::new(ix + 7.0, iy + 8.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
         // ─── tooltip ──────────────────────────────────────────
         // Hit-test the cursor against each slice. Convert
         // `pointer_local` (relative to the painter rect) to
@@ -1490,8 +1620,10 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
         // `[inner_r, outer_r]` AND the angle is inside one of the
         // slice's `[a0, a1]` ranges (normalised against the
         // start_offset wrap), show a pill with the slice's
-        // weight + percentage near the cursor.
-        if tooltip && !disabled && resp.hovered {
+        // weight + percentage near the cursor. Skipped when the
+        // cursor sits over the PiP icon to avoid two overlapping
+        // affordances.
+        if tooltip && !disabled && resp.hovered && !pointer_in_pip {
             if let Some(local) = resp.pointer_local {
                 let px_pt = p.rect().x() + local.x;
                 let py_pt = p.rect().y() + local.y;
@@ -1593,6 +1725,7 @@ impl<'a> PortalUi<'a> {
             center: true,
             tooltip: true,
             tooltip_unit: None,
+            pip: false,
         }
     }
 }
