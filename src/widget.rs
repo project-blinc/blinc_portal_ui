@@ -1045,6 +1045,265 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// pie_chart — slice-weight visualiser. Distinct from `chart` because
+// the data shape (weights vs time series) and the knobs (slice
+// palette + inner radius) don't overlap. Use for portion / mix
+// breakdowns: connection-state counts, port-kind distribution, etc.
+// ─────────────────────────────────────────────────────────────────────
+
+#[must_use = "PieChartBuilder is lazy — call .show() / .changed() to paint"]
+pub struct PieChartBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, Vec<f32>>,
+    diameter: Option<f32>,
+    /// Hole radius as a fraction of outer radius. `0.0` = solid
+    /// pie, `0.5` = donut, `0.85` = ring gauge.
+    inner_ratio: f32,
+    /// Explicit per-slice palette. `None` rotates through HSV
+    /// variations of the theme accent so each slice gets a
+    /// distinct, theme-coherent colour.
+    palette: Option<Vec<Color>>,
+    /// 4 px gap between slices (rendered as a thin radial wedge in
+    /// the background colour). `0.0` = continuous fill.
+    slice_gap: f32,
+    background: Option<Color>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for PieChartBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> PieChartBuilder<'a, 'b> {
+    /// Outer diameter in pixels. Default 96 (24 grid units). The
+    /// painter rect is `diameter × diameter`; the pie is centred.
+    pub fn diameter(mut self, d: f32) -> Self {
+        self.diameter = Some(d.max(8.0));
+        self
+    }
+    /// Hole radius as a fraction of the outer radius.
+    /// `0.0` (default) is a solid pie; `0.5` is a donut;
+    /// `>= 0.95` clamps to a thin ring so the inner / outer arcs
+    /// don't collapse on top of each other.
+    pub fn inner_ratio(mut self, r: f32) -> Self {
+        self.inner_ratio = r.clamp(0.0, 0.95);
+        self
+    }
+    /// Convenience for `.inner_ratio(0.5)`.
+    pub fn donut(mut self) -> Self {
+        self.inner_ratio = 0.5;
+        self
+    }
+    /// Explicit per-slice colour palette. Cycles when `palette.len() < data.len()`.
+    /// Pass theme tokens (`ColorToken::Accent`, `::Success`, etc.)
+    /// resolved at the call site to stay theme-coherent.
+    pub fn palette(mut self, colors: Vec<Color>) -> Self {
+        self.palette = Some(colors);
+        self
+    }
+    /// Background colour painted under the pie. `None` = transparent.
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    /// Pixel gap between adjacent slices (rendered by painting a
+    /// thin radial gap in the background colour over the join).
+    /// Disabled when `background` is None — the gap needs a
+    /// concrete colour to paint over the slice fills.
+    pub fn slice_gap(mut self, px: f32) -> Self {
+        self.slice_gap = px.max(0.0);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::layer::Vec2;
+
+        let PieChartBuilder {
+            ui,
+            value,
+            diameter,
+            inner_ratio,
+            palette,
+            slice_gap,
+            background,
+            disabled,
+            shadow_token,
+        } = self;
+
+        let style = ui.style.clone();
+        let d = diameter.unwrap_or(96.0);
+        let weights: Vec<f32> = value.get();
+
+        let (mut p, resp) = ui.allocate_painter((d, d), Sense::None);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+        if let Some(bg) = background {
+            let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+            p.fill_self(&style, Brush::Solid(bg));
+        }
+
+        // Total + finite filter — NaN / negative weights ignored.
+        let mut total = 0.0_f32;
+        for &w in &weights {
+            if w.is_finite() && w > 0.0 {
+                total += w;
+            }
+        }
+        if total <= 0.0 || d < 8.0 {
+            return resp;
+        }
+
+        let cx = p.rect().x() + d * 0.5;
+        let cy = p.rect().y() + d * 0.5;
+        let outer_r = (d * 0.5) - 2.0;
+        let inner_r = outer_r * inner_ratio;
+        let outer_radii = Vec2::new(outer_r, outer_r);
+        let inner_radii = Vec2::new(inner_r, inner_r);
+        let alpha = if disabled { 0.4 } else { 1.0 };
+        let (h0, _s0, _v0, _a0) = style.accent.to_hsva();
+
+        // Default palette — HSV-rotate the theme accent through
+        // golden-angle steps so adjacent slices stay distinct.
+        let default_color = |i: usize| -> Color {
+            const GOLDEN: f32 = 137.508;
+            let h = (h0 + GOLDEN * i as f32).rem_euclid(360.0);
+            Color::from_hsva(h, 0.55, 0.92, alpha)
+        };
+
+        // Sweep slices CW from -PI/2 (top of pie at 12 o'clock).
+        let two_pi = std::f32::consts::TAU;
+        let start_offset = -std::f32::consts::FRAC_PI_2;
+        let mut acc = 0.0_f32;
+        let mut slice_idx = 0;
+        for (i, &w) in weights.iter().enumerate() {
+            if !w.is_finite() || w <= 0.0 {
+                continue;
+            }
+            let a0 = start_offset + acc / total * two_pi;
+            acc += w;
+            let a1 = start_offset + acc / total * two_pi;
+
+            let color = palette
+                .as_ref()
+                .and_then(|p| p.get(i % p.len()).copied())
+                .map(|c| if disabled { c.with_alpha(0.4) } else { c })
+                .unwrap_or_else(|| default_color(slice_idx));
+            slice_idx += 1;
+
+            // Build slice path: from inner-start, out to outer-
+            // start, arc CW to outer-end, in to inner-end, arc CCW
+            // back to inner-start. Reduces to a wedge from the
+            // centre when inner_r == 0.
+            let (sa, ca) = (a0.sin(), a0.cos());
+            let (sb, cb) = (a1.sin(), a1.cos());
+            let outer_start = Point::new(cx + outer_r * ca, cy + outer_r * sa);
+            let outer_end = Point::new(cx + outer_r * cb, cy + outer_r * sb);
+            // arc_to needs the large-arc flag set when the arc
+            // exceeds half a turn (a slice with > 50% of the pie).
+            let large = (a1 - a0).abs() > std::f32::consts::PI;
+            let mut path = blinc_core::draw::Path::new();
+            if inner_r > 0.0 {
+                let inner_start = Point::new(cx + inner_r * ca, cy + inner_r * sa);
+                let inner_end = Point::new(cx + inner_r * cb, cy + inner_r * sb);
+                path = path
+                    .move_to(inner_start.x, inner_start.y)
+                    .line_to(outer_start.x, outer_start.y)
+                    .arc_to(outer_radii, 0.0, large, true, outer_end.x, outer_end.y)
+                    .line_to(inner_end.x, inner_end.y)
+                    .arc_to(inner_radii, 0.0, large, false, inner_start.x, inner_start.y)
+                    .close();
+            } else {
+                path = path
+                    .move_to(cx, cy)
+                    .line_to(outer_start.x, outer_start.y)
+                    .arc_to(outer_radii, 0.0, large, true, outer_end.x, outer_end.y)
+                    .close();
+            }
+            p.fill_path(&path, Brush::Solid(color));
+        }
+
+        // Slice-gap stroke pass — paint over the slice seams in the
+        // background colour. Only meaningful when a background was
+        // declared; transparent backgrounds get no gap (would punch
+        // a hole through to whatever sits below).
+        if slice_gap > 0.0 {
+            if let Some(bg) = background {
+                let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+                let mut acc = 0.0_f32;
+                for &w in &weights {
+                    if !w.is_finite() || w <= 0.0 {
+                        continue;
+                    }
+                    let a = start_offset + acc / total * two_pi;
+                    acc += w;
+                    let (sa, ca) = (a.sin(), a.cos());
+                    let inner_pt =
+                        Point::new(cx + inner_r.max(0.0) * ca, cy + inner_r.max(0.0) * sa);
+                    let outer_pt = Point::new(cx + outer_r * ca, cy + outer_r * sa);
+                    let gap_path = blinc_core::draw::Path::new()
+                        .move_to(inner_pt.x, inner_pt.y)
+                        .line_to(outer_pt.x, outer_pt.y);
+                    p.stroke_path(&gap_path, &Stroke::new(slice_gap), Brush::Solid(bg));
+                }
+            }
+        }
+
+        resp
+    }
+
+    pub fn changed(self) -> bool {
+        self.show().changed
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Pie / donut chart bound to a `Vec<f32>` of slice weights.
+    /// Weights are auto-normalised to their sum; NaN / Inf /
+    /// non-positive entries are skipped. Each slice picks a colour
+    /// from `.palette(...)` if supplied, otherwise rotates HSV
+    /// hues from the theme accent via the golden-angle step so
+    /// adjacent slices stay distinct.
+    ///
+    /// Chain `.diameter(...)` / `.donut()` / `.inner_ratio(...)` /
+    /// `.palette(...)` / `.slice_gap(...)` / `.background(...)` /
+    /// `.shadow_*()` then `.show()`.
+    pub fn pie_chart<'b, V: PortalValue<'b, Vec<f32>>>(
+        &'b mut self,
+        weights: V,
+    ) -> PieChartBuilder<'a, 'b> {
+        PieChartBuilder {
+            ui: self,
+            value: weights.into_binding(),
+            diameter: None,
+            inner_ratio: 0.0,
+            palette: None,
+            slice_gap: 0.0,
+            background: None,
+            disabled: false,
+            shadow_token: None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // slider — horizontal, fixed width follows available size
 // ─────────────────────────────────────────────────────────────────────
 
