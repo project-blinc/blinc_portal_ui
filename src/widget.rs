@@ -3092,6 +3092,452 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// sdf_shape — single-shape SDF visualiser. 2D variants paint
+// directly via fill_circle / fill_rect; 3D variants set the
+// `DrawContext`'s 3D state (perspective + shape kind + light)
+// then emit a fill_rect whose fragment shader raymarches the
+// chosen SDF. State is reset after the paint so downstream
+// widgets don't inherit the 3D shading.
+// ─────────────────────────────────────────────────────────────────────
+
+/// SDF shape variants — 2D and 3D. The 3D-variant integer
+/// values match the `shape_type` field consumed by
+/// `DrawContext::set_3d_shape` (1 = box, 2 = sphere, …).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdfShape {
+    /// 2D — flat-filled circle.
+    Circle2D,
+    /// 2D — flat-filled rounded rect.
+    RoundedBox2D,
+    /// 2D — capsule (rect with 50 % corner radius).
+    Capsule2D,
+    /// 3D — extruded box with Blinn-Phong shading.
+    Box3D,
+    /// 3D — sphere with Blinn-Phong shading.
+    Sphere3D,
+    /// 3D — cylinder with Blinn-Phong shading.
+    Cylinder3D,
+    /// 3D — torus with Blinn-Phong shading.
+    Torus3D,
+    /// 3D — capsule (rounded-end pill) with Blinn-Phong shading.
+    Capsule3D,
+}
+
+impl SdfShape {
+    fn is_3d(self) -> bool {
+        matches!(
+            self,
+            SdfShape::Box3D
+                | SdfShape::Sphere3D
+                | SdfShape::Cylinder3D
+                | SdfShape::Torus3D
+                | SdfShape::Capsule3D
+        )
+    }
+
+    fn shape_type_3d(self) -> f32 {
+        // Mirrors blinc_gpu's shape_type encoding: 1 box, 2 sphere,
+        // 3 cylinder, 4 torus, 5 capsule, 6 group (unused here).
+        match self {
+            SdfShape::Box3D => 1.0,
+            SdfShape::Sphere3D => 2.0,
+            SdfShape::Cylinder3D => 3.0,
+            SdfShape::Torus3D => 4.0,
+            SdfShape::Capsule3D => 5.0,
+            _ => 0.0,
+        }
+    }
+}
+
+#[must_use = "SdfShapeBuilder is lazy — call .show() to paint"]
+pub struct SdfShapeBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    shape: SdfShape,
+    width_override: Option<f32>,
+    height_override: Option<f32>,
+    fill: Option<Color>,
+    stroke: Option<Color>,
+    stroke_width: f32,
+    /// 3D depth (extrusion magnitude) as a fraction of the
+    /// painter's min side. Default `0.5` — half-depth gives a
+    /// good 3D parallax read at 96 × 96 sizes.
+    depth: f32,
+    /// 3D rotation around the X axis in radians. Default `0.35`
+    /// (~20°) for a gentle tilt that exposes top + front faces
+    /// on a box.
+    rotate_x: f32,
+    /// 3D rotation around the Y axis in radians. Default `0.7`
+    /// (~40°) so a box reveals 3 faces.
+    rotate_y: f32,
+    /// Ambient lighting contribution (0..1). Default `0.3`.
+    ambient: f32,
+    /// Specular highlight sharpness. Default `32.0`.
+    specular: f32,
+    /// 3D light direction (normalised in the shader). Default
+    /// `[-0.5, -1.0, 0.5]` for a soft top-front key.
+    light_dir: [f32; 3],
+    /// 3D light intensity multiplier. Default `0.8`.
+    light_intensity: f32,
+    /// Corner radius for the 2D RoundedBox2D variant.
+    corner_radius: f32,
+    background: Option<Color>,
+    show_border: bool,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+    pip: bool,
+}
+
+impl<'a, 'b> ShadowMix for SdfShapeBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
+    pub fn shape(mut self, s: SdfShape) -> Self {
+        self.shape = s;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.height_override = Some(h);
+        self
+    }
+    pub fn fill(mut self, c: Color) -> Self {
+        self.fill = Some(c);
+        self
+    }
+    pub fn stroke(mut self, c: Color) -> Self {
+        self.stroke = Some(c);
+        self
+    }
+    pub fn stroke_width(mut self, w: f32) -> Self {
+        self.stroke_width = w.max(0.0);
+        self
+    }
+    pub fn depth(mut self, d: f32) -> Self {
+        self.depth = d.clamp(0.0, 2.0);
+        self
+    }
+    pub fn rotate_x(mut self, r: f32) -> Self {
+        self.rotate_x = r;
+        self
+    }
+    pub fn rotate_y(mut self, r: f32) -> Self {
+        self.rotate_y = r;
+        self
+    }
+    pub fn ambient(mut self, a: f32) -> Self {
+        self.ambient = a.clamp(0.0, 1.0);
+        self
+    }
+    pub fn specular(mut self, s: f32) -> Self {
+        self.specular = s.max(0.0);
+        self
+    }
+    pub fn light(mut self, direction: [f32; 3], intensity: f32) -> Self {
+        self.light_dir = direction;
+        self.light_intensity = intensity.max(0.0);
+        self
+    }
+    pub fn corner_radius(mut self, r: f32) -> Self {
+        self.corner_radius = r.max(0.0);
+        self
+    }
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    pub fn show_border(mut self, b: bool) -> Self {
+        self.show_border = b;
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::layer::{CornerRadius, Rect};
+
+        let SdfShapeBuilder {
+            ui,
+            shape,
+            width_override,
+            height_override,
+            fill,
+            stroke,
+            stroke_width,
+            depth,
+            rotate_x,
+            rotate_y,
+            ambient,
+            specular,
+            light_dir,
+            light_intensity,
+            corner_radius,
+            background,
+            show_border,
+            disabled,
+            shadow_token,
+            pip,
+        } = self;
+
+        let style = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(96.0, 160.0));
+        let height = height_override.unwrap_or(96.0);
+
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else {
+            Sense::None
+        };
+        let pip_strip = if pip && !disabled { 24.0 } else { 0.0 };
+        let alloc_h = height + pip_strip;
+        let (mut p, mut resp) = ui.allocate_painter((width, alloc_h), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+
+        let img_x = p.rect().x();
+        let img_y = p.rect().y() + pip_strip;
+        let outer = Rect::new(img_x, img_y, width, height);
+        if let Some(bg) = background {
+            let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+            p.fill_rect(outer, CornerRadius::uniform(8.0), Brush::Solid(bg));
+        }
+        if show_border {
+            p.stroke_rect(
+                outer,
+                CornerRadius::uniform(8.0),
+                &Stroke::new(1.0),
+                Brush::Solid(style.field_border),
+            );
+        }
+
+        // Inner content rect — leave a small inset so the shape
+        // doesn't kiss the border.
+        let pad = 8.0_f32;
+        let inner = Rect::new(
+            img_x + pad,
+            img_y + pad,
+            (width - 2.0 * pad).max(0.0),
+            (height - 2.0 * pad).max(0.0),
+        );
+        let min_side = inner.width().min(inner.height());
+        let alpha = if disabled { 0.5 } else { 1.0 };
+        let fill_brush = fill.unwrap_or(style.accent).with_alpha(alpha);
+
+        // ─── 2D variants ──────────────────────────────────────
+        match shape {
+            SdfShape::Circle2D => {
+                let r = min_side * 0.5;
+                let cx = inner.x() + inner.width() * 0.5;
+                let cy = inner.y() + inner.height() * 0.5;
+                p.fill_circle(Point::new(cx, cy), r, Brush::Solid(fill_brush));
+                if let Some(sc) = stroke {
+                    p.stroke_circle(
+                        Point::new(cx, cy),
+                        r,
+                        &Stroke::new(stroke_width.max(1.0)),
+                        Brush::Solid(sc.with_alpha(alpha)),
+                    );
+                }
+            }
+            SdfShape::RoundedBox2D => {
+                p.fill_rect(
+                    inner,
+                    CornerRadius::uniform(corner_radius),
+                    Brush::Solid(fill_brush),
+                );
+                if let Some(sc) = stroke {
+                    p.stroke_rect(
+                        inner,
+                        CornerRadius::uniform(corner_radius),
+                        &Stroke::new(stroke_width.max(1.0)),
+                        Brush::Solid(sc.with_alpha(alpha)),
+                    );
+                }
+            }
+            SdfShape::Capsule2D => {
+                let r = inner.height() * 0.5;
+                p.fill_rect(
+                    inner,
+                    CornerRadius::uniform(r),
+                    Brush::Solid(fill_brush),
+                );
+                if let Some(sc) = stroke {
+                    p.stroke_rect(
+                        inner,
+                        CornerRadius::uniform(r),
+                        &Stroke::new(stroke_width.max(1.0)),
+                        Brush::Solid(sc.with_alpha(alpha)),
+                    );
+                }
+            }
+            _ if shape.is_3d() => {
+                // ─── 3D variants ──────────────────────────────
+                // Set DrawContext 3D state, emit a primitive, then
+                // reset state so downstream widgets don't inherit
+                // the shape / lighting params. The GPU fragment
+                // shader raymarches the chosen SDF; the primitive
+                // we emit is a fill_rect whose bounds size the
+                // marching volume.
+                let ctx = &mut *p.ctx;
+                ctx.set_3d_transform(rotate_x, rotate_y, 800.0);
+                ctx.set_3d_shape(
+                    shape.shape_type_3d(),
+                    depth * min_side,
+                    ambient,
+                    specular,
+                );
+                ctx.set_3d_light(light_dir, light_intensity);
+
+                // For a sphere / cylinder / torus the shader uses
+                // the rect's inscribed circle; for box / capsule
+                // it uses the rect bounds. Either way we square
+                // the inner rect so the proportions read right.
+                let sq = min_side;
+                let shape_rect = Rect::new(
+                    inner.x() + (inner.width() - sq) * 0.5,
+                    inner.y() + (inner.height() - sq) * 0.5,
+                    sq,
+                    sq,
+                );
+                p.fill_rect(
+                    shape_rect,
+                    CornerRadius::uniform(0.0),
+                    Brush::Solid(fill_brush),
+                );
+
+                // Reset 3D state — shape_type 0 disables SDF in
+                // the shader, transform back to identity, light
+                // intensity to 0.
+                let ctx = &mut *p.ctx;
+                ctx.set_3d_shape(0.0, 0.0, 0.3, 32.0);
+                ctx.set_3d_transform(0.0, 0.0, 0.0);
+                ctx.set_3d_light([0.0, 0.0, 0.0], 0.0);
+                ctx.set_3d_translate_z(0.0);
+            }
+            _ => {}
+        }
+
+        // PiP corner button (same shape as every chart / noise /
+        // texture widget).
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let pad = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+                let by = p.rect().y() + pad;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let pad = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+            let by = p.rect().y() + pad;
+            let btn_rect = Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (style.button_hover, style.field_border_focus, style.text_primary)
+            } else {
+                (style.background, style.field_border, style.text_secondary)
+            };
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
+            p.stroke_rect(
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
+            p.stroke_rect(
+                Rect::new(gx, gy, GW, GH),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            p.fill_rect(
+                Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
+        resp
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// SDF shape preview — single shape painted into a small
+    /// rect. 2D variants use direct fill primitives;
+    /// 3D variants drive the GPU's per-element raymarching SDF
+    /// (box / sphere / cylinder / torus / capsule) via the
+    /// `set_3d_*` state on `DrawContext`. Chain `.shape(...)` /
+    /// `.depth(...)` / `.rotate_x(...)` / `.rotate_y(...)` /
+    /// `.light(...)` for 3D variants; `.fill(c)` / `.stroke(c)` /
+    /// `.corner_radius(r)` for 2D; `.show_border(false)` /
+    /// `.background(c)` / `.shadow_*()` for chrome; `.pip(true)`
+    /// for the corner popover button.
+    pub fn sdf_shape<'b>(&'b mut self, shape: SdfShape) -> SdfShapeBuilder<'a, 'b> {
+        SdfShapeBuilder {
+            ui: self,
+            shape,
+            width_override: None,
+            height_override: None,
+            fill: None,
+            stroke: None,
+            stroke_width: 1.5,
+            depth: 0.5,
+            rotate_x: 0.35,
+            rotate_y: 0.7,
+            ambient: 0.3,
+            specular: 32.0,
+            light_dir: [-0.5, -1.0, 0.5],
+            light_intensity: 0.8,
+            corner_radius: 12.0,
+            background: None,
+            show_border: true,
+            disabled: false,
+            shadow_token: None,
+            pip: false,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // slider — horizontal, fixed width follows available size
 // ─────────────────────────────────────────────────────────────────────
 
