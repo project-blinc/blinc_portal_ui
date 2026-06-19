@@ -3159,8 +3159,11 @@ pub struct SdfShapeBuilder<'a, 'b> {
     stroke: Option<Color>,
     stroke_width: f32,
     /// 3D depth (extrusion magnitude) as a fraction of the
-    /// painter's min side. Default `0.5` — half-depth gives a
-    /// good 3D parallax read at 96 × 96 sizes.
+    /// painter's min side. Default `1.0` — one full min-side
+    /// worth of z-extrusion. Curved SDFs (sphere / torus /
+    /// cylinder) need at least this for the silhouette to read
+    /// crisp; values < 0.5 make the raymarcher hit the back
+    /// face inside the anti-alias band and edges go soft.
     depth: f32,
     /// 3D rotation around the X axis in radians. Default `0.35`
     /// (~20°) for a gentle tilt that exposes top + front faces
@@ -3520,7 +3523,14 @@ impl<'a> PortalUi<'a> {
             fill: None,
             stroke: None,
             stroke_width: 1.5,
-            depth: 0.5,
+            // depth=1.0 == one full min-side worth of z-extrusion.
+            // Curved SDFs (sphere / torus / cylinder) need at
+            // least this much depth for the silhouette to read
+            // crisp at small widget sizes — too-shallow z makes
+            // the raymarcher hit the back face inside the
+            // anti-alias band and the edges go soft. Box reads
+            // fine at any depth.
+            depth: 1.0,
             rotate_x: 0.35,
             rotate_y: 0.7,
             ambient: 0.3,
