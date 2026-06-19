@@ -604,6 +604,447 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// chart — inline dataflow visualiser. Sparkline-style line + bar
+// variants for node-content slots. Reads from a `PortalValue<Vec<f32>>`
+// so both `&mut Vec<f32>` and `&Signal<Vec<f32>>` work. Decimates to
+// the painter's column budget when `data.len()` exceeds it; auto-
+// scales y by default with `.y_range(...)` override. Paint-only —
+// `Response::changed` is always `false` (parity with the other
+// builders).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Chart render style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChartVariant {
+    /// Connected line strip across the data points. Default.
+    #[default]
+    Line,
+    /// One filled rect per sample, baseline-anchored.
+    Bar,
+    /// Line + fill under it down to the baseline.
+    Area,
+}
+
+/// Decimation strategy when `data.len()` exceeds the painter's
+/// column budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChartDecimation {
+    /// Index-stride pick — collapses to N evenly-spaced samples;
+    /// the last sample is always preserved so a sparkline shows
+    /// the current value. Cheap and visually fine for slow-moving
+    /// telemetry.
+    #[default]
+    Stride,
+    /// Min/max bucketing — each bucket emits two anchors (min then
+    /// max) so peaks survive at any decimation ratio. Doubles the
+    /// vertex count vs `Stride` but preserves the envelope of
+    /// noisy signals.
+    MinMax,
+}
+
+#[must_use = "ChartsBuilder is lazy — call .show() / .changed() to paint"]
+pub struct ChartsBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, Vec<f32>>,
+    variant: ChartVariant,
+    width_override: Option<f32>,
+    height_override: Option<f32>,
+    y_range: Option<std::ops::Range<f32>>,
+    line_width: f32,
+    bar_gap: f32,
+    show_baseline: bool,
+    show_latest: bool,
+    fill_area: bool,
+    decimation: ChartDecimation,
+    stroke_color: Option<Color>,
+    fill_color: Option<Color>,
+    baseline_color: Option<Color>,
+    background: Option<Color>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for ChartsBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> ChartsBuilder<'a, 'b> {
+    pub fn variant(mut self, v: ChartVariant) -> Self {
+        self.variant = v;
+        self
+    }
+    pub fn line(mut self) -> Self {
+        self.variant = ChartVariant::Line;
+        self
+    }
+    pub fn bar(mut self) -> Self {
+        self.variant = ChartVariant::Bar;
+        self
+    }
+    pub fn area(mut self) -> Self {
+        self.variant = ChartVariant::Area;
+        self.fill_area = true;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.height_override = Some(h);
+        self
+    }
+    pub fn y_range(mut self, r: std::ops::Range<f32>) -> Self {
+        self.y_range = Some(r);
+        self
+    }
+    pub fn line_width(mut self, w: f32) -> Self {
+        self.line_width = w.max(0.5);
+        self
+    }
+    pub fn bar_gap(mut self, g: f32) -> Self {
+        self.bar_gap = g.max(0.0);
+        self
+    }
+    pub fn fill_area(mut self, b: bool) -> Self {
+        self.fill_area = b;
+        self
+    }
+    pub fn show_baseline(mut self, b: bool) -> Self {
+        self.show_baseline = b;
+        self
+    }
+    pub fn show_latest(mut self, b: bool) -> Self {
+        self.show_latest = b;
+        self
+    }
+    pub fn decimation(mut self, d: ChartDecimation) -> Self {
+        self.decimation = d;
+        self
+    }
+    pub fn stroke_color(mut self, c: Color) -> Self {
+        self.stroke_color = Some(c);
+        self
+    }
+    pub fn fill_color(mut self, c: Color) -> Self {
+        self.fill_color = Some(c);
+        self
+    }
+    pub fn baseline_color(mut self, c: Color) -> Self {
+        self.baseline_color = Some(c);
+        self
+    }
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::draw::{LineCap, LineJoin};
+        use blinc_core::layer::{CornerRadius, Rect};
+
+        let ChartsBuilder {
+            ui,
+            value,
+            variant,
+            width_override,
+            height_override,
+            y_range,
+            line_width,
+            bar_gap,
+            show_baseline,
+            show_latest,
+            fill_area,
+            decimation,
+            stroke_color,
+            fill_color,
+            baseline_color,
+            background,
+            disabled,
+            shadow_token,
+        } = self;
+
+        let style = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        // Defaults — 240 × 80 is the inline-sparkline sweet spot.
+        // Width follows the parent allocation when unset, clamped
+        // to a sensible band; height pins to 80 px (20 grid units).
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(120.0, 240.0));
+        let height = height_override.unwrap_or(80.0);
+
+        let data: Vec<f32> = value.get();
+        let (mut p, resp) = ui.allocate_painter((width, height), Sense::None);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+        if let Some(bg) = background {
+            let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+            p.fill_self(&style, Brush::Solid(bg));
+        }
+
+        // 4 px inner padding so series strokes don't kiss the
+        // painter rect edge.
+        let pad = 4.0_f32;
+        let plot_x = p.rect().x() + pad;
+        let plot_y = p.rect().y() + pad;
+        let plot_w = (p.rect().width() - 2.0 * pad).max(0.0);
+        let plot_h = (p.rect().height() - 2.0 * pad).max(0.0);
+        if plot_w < 2.0 || plot_h < 2.0 || data.is_empty() {
+            return resp;
+        }
+
+        // NaN-safe lo/hi.
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &v in &data {
+            if v.is_finite() {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        let (lo, hi) = if !lo.is_finite() || !hi.is_finite() {
+            (0.0, 1.0)
+        } else if let Some(r) = y_range.clone() {
+            (r.start, r.end)
+        } else if (hi - lo).abs() < 1e-6 {
+            (lo - 0.5, hi + 0.5)
+        } else {
+            (lo, hi)
+        };
+        let span = (hi - lo).max(1e-6);
+        let y_of = |v: f32| -> f32 {
+            let t = ((v - lo) / span).clamp(0.0, 1.0);
+            plot_y + plot_h * (1.0 - t)
+        };
+
+        // Column budget — Line/Area get one vertex per pixel, Bar
+        // gets one column per `(1 + bar_gap)` px.
+        let col_budget: usize = match variant {
+            ChartVariant::Bar => ((plot_w / (1.0 + bar_gap)).floor() as usize).max(1),
+            _ => (plot_w.floor() as usize).max(2),
+        };
+
+        let samples: Vec<f32> = if data.len() <= col_budget {
+            data.iter()
+                .map(|v| if v.is_finite() { *v } else { lo })
+                .collect()
+        } else {
+            match decimation {
+                ChartDecimation::Stride => {
+                    let n = col_budget;
+                    (0..n)
+                        .map(|i| {
+                            let idx = (i * data.len()) / n;
+                            let v = data[idx.min(data.len() - 1)];
+                            if v.is_finite() {
+                                v
+                            } else {
+                                lo
+                            }
+                        })
+                        .collect()
+                }
+                ChartDecimation::MinMax => {
+                    let buckets = (col_budget / 2).max(1);
+                    let mut out: Vec<f32> = Vec::with_capacity(buckets * 2);
+                    for b in 0..buckets {
+                        let s = (b * data.len()) / buckets;
+                        let e = ((b + 1) * data.len()) / buckets;
+                        let end = e.max(s + 1).min(data.len());
+                        let slice = &data[s..end];
+                        let mut mn = f32::INFINITY;
+                        let mut mx = f32::NEG_INFINITY;
+                        for &v in slice {
+                            if v.is_finite() {
+                                mn = mn.min(v);
+                                mx = mx.max(v);
+                            }
+                        }
+                        if !mn.is_finite() {
+                            mn = lo;
+                            mx = lo;
+                        }
+                        out.push(mn);
+                        out.push(mx);
+                    }
+                    out
+                }
+            }
+        };
+
+        // Theme palette resolution.
+        let stroke_brush_base = stroke_color.unwrap_or(style.accent);
+        let fill_brush_base = fill_color.unwrap_or(style.accent.with_alpha(0.15));
+        let baseline_col_base =
+            baseline_color.unwrap_or(style.text_secondary.with_alpha(0.3));
+        let (stroke_brush, fill_brush, baseline_col) = if disabled {
+            (
+                stroke_brush_base.with_alpha(0.4),
+                fill_brush_base.with_alpha(0.4),
+                baseline_col_base.with_alpha(0.4),
+            )
+        } else {
+            (stroke_brush_base, fill_brush_base, baseline_col_base)
+        };
+
+        if show_baseline {
+            let by = if lo <= 0.0 && hi >= 0.0 {
+                y_of(0.0)
+            } else {
+                plot_y + plot_h
+            };
+            p.fill_rect(
+                Rect::new(plot_x, by - 0.5, plot_w, 1.0),
+                CornerRadius::uniform(0.0),
+                Brush::Solid(baseline_col),
+            );
+        }
+
+        let n = samples.len();
+        let x_of = |i: usize| -> f32 {
+            if n <= 1 {
+                plot_x
+            } else {
+                plot_x + (i as f32) * (plot_w / ((n - 1) as f32))
+            }
+        };
+
+        match variant {
+            ChartVariant::Bar => {
+                let baseline_y = if lo <= 0.0 && hi >= 0.0 {
+                    y_of(0.0)
+                } else {
+                    plot_y + plot_h
+                };
+                let col_w = plot_w / n.max(1) as f32;
+                let bar_w = (col_w - bar_gap).max(1.0);
+                for (i, &v) in samples.iter().enumerate() {
+                    let cx = plot_x + (i as f32 + 0.5) * col_w;
+                    let bar_x = cx - bar_w * 0.5;
+                    let yv = y_of(v);
+                    let (top, h) = if yv <= baseline_y {
+                        (yv, baseline_y - yv)
+                    } else {
+                        (baseline_y, yv - baseline_y)
+                    };
+                    if h >= 0.5 {
+                        p.fill_rect(
+                            Rect::new(bar_x, top, bar_w, h),
+                            CornerRadius::uniform((bar_w * 0.25).min(2.0)),
+                            Brush::Solid(stroke_brush),
+                        );
+                    }
+                }
+            }
+            ChartVariant::Line | ChartVariant::Area => {
+                if n == 1 {
+                    p.fill_circle(
+                        Point::new(x_of(0), y_of(samples[0])),
+                        line_width.max(1.5),
+                        Brush::Solid(stroke_brush),
+                    );
+                } else {
+                    let mut path = blinc_core::draw::Path::new();
+                    path = path.move_to(x_of(0), y_of(samples[0]));
+                    for i in 1..n {
+                        path = path.line_to(x_of(i), y_of(samples[i]));
+                    }
+                    let area_on = fill_area || matches!(variant, ChartVariant::Area);
+                    if area_on {
+                        let base_y = if lo <= 0.0 && hi >= 0.0 {
+                            y_of(0.0)
+                        } else {
+                            plot_y + plot_h
+                        };
+                        let mut area = blinc_core::draw::Path::new();
+                        area = area.move_to(x_of(0), base_y);
+                        for i in 0..n {
+                            area = area.line_to(x_of(i), y_of(samples[i]));
+                        }
+                        area = area.line_to(x_of(n - 1), base_y).close();
+                        p.fill_path(&area, Brush::Solid(fill_brush));
+                    }
+                    let stroke = Stroke::new(line_width)
+                        .with_cap(LineCap::Round)
+                        .with_join(LineJoin::Round);
+                    p.stroke_path(&path, &stroke, Brush::Solid(stroke_brush));
+                }
+                if show_latest {
+                    let li = n - 1;
+                    p.fill_circle(
+                        Point::new(x_of(li), y_of(samples[li])),
+                        line_width + 1.0,
+                        Brush::Solid(stroke_brush),
+                    );
+                }
+            }
+        }
+
+        resp
+    }
+
+    pub fn changed(self) -> bool {
+        self.show().changed
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Inline dataflow chart — line / bar / area variants bound to
+    /// a `Vec<f32>` series. Use for sparklines in node-content
+    /// slots, slow-moving telemetry, simple histograms. Chain
+    /// `.line()` / `.bar()` / `.area()` / `.show_latest()` /
+    /// `.show_baseline()` / `.y_range(...)` / `.width()` /
+    /// `.height()` / `.shadow_*()` then `.show()` / `.changed()`.
+    ///
+    /// Decimates to the painter's column budget when `data.len()`
+    /// exceeds it (`.decimation(...)` picks `Stride` vs `MinMax`).
+    /// Reads theme tokens for stroke / fill / baseline; explicit
+    /// `.stroke_color(...)` etc. overrides exist for series that
+    /// want a non-accent palette (e.g. warning / error tones).
+    pub fn chart<'b, V: PortalValue<'b, Vec<f32>>>(
+        &'b mut self,
+        data: V,
+    ) -> ChartsBuilder<'a, 'b> {
+        ChartsBuilder {
+            ui: self,
+            value: data.into_binding(),
+            variant: ChartVariant::Line,
+            width_override: None,
+            height_override: None,
+            y_range: None,
+            line_width: 1.5,
+            bar_gap: 2.0,
+            show_baseline: false,
+            show_latest: false,
+            fill_area: false,
+            decimation: ChartDecimation::Stride,
+            stroke_color: None,
+            fill_color: None,
+            baseline_color: None,
+            background: None,
+            disabled: false,
+            shadow_token: None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // slider — horizontal, fixed width follows available size
 // ─────────────────────────────────────────────────────────────────────
 

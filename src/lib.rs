@@ -28,8 +28,8 @@ pub use crate::core::{
     ValueBinding, WidgetId,
 };
 pub use crate::widget::{
-    ButtonBuilder, ColorPickerBuilder, NumericInputBuilder, SelectBuilder, SliderBuilder,
-    SwitchBuilder, TextInputBuilder,
+    ButtonBuilder, ChartDecimation, ChartVariant, ChartsBuilder, ColorPickerBuilder,
+    NumericInputBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder,
 };
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;
