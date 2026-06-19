@@ -3406,14 +3406,18 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
                 // widget sizes).
                 let ctx = &mut *p.ctx;
                 ctx.push_clip(ClipShape::rect(inner));
-                // perspective_d = 1400 pulls the virtual camera
-                // back a fair bit. The default 800 from the CSS
-                // pipeline reads as "in your face" inside a 96 px
-                // preview — the projected shape silhouette
-                // exceeds the rect. A larger value flattens the
-                // perspective so the rotated shape stays within
-                // bounds.
-                ctx.set_3d_transform(rotate_x, rotate_y, 1400.0);
+                // perspective_d pulls the virtual camera back.
+                // Box / cylinder have square / rectangular
+                // silhouettes that span the full rotated
+                // bounding box — they need more distance to fit
+                // (~2000 instead of 1400). Sphere / torus /
+                // capsule have rounder projections that already
+                // fit at 1400.
+                let persp = match shape {
+                    SdfShape::Box3D | SdfShape::Cylinder3D => 2000.0,
+                    _ => 1400.0,
+                };
+                ctx.set_3d_transform(rotate_x, rotate_y, persp);
                 ctx.set_3d_shape(
                     shape.shape_type_3d(),
                     depth * min_side,
