@@ -99,6 +99,20 @@ impl<'a> PortalPainter<'a> {
         self.ctx.draw_rgba_pixels(data, width, height, dest);
     }
 
+    /// Paint an already-loaded image (`ImageId` from the host's
+    /// asset cache) into `rect`. Same primitive every cn / layout
+    /// widget uses for static image content; thin passthrough so
+    /// portal_ui widgets can consume host-provided textures
+    /// without re-uploading raw bytes each frame.
+    pub fn draw_image(
+        &mut self,
+        image: blinc_core::draw::ImageId,
+        rect: Rect,
+        options: &blinc_core::draw::ImageOptions,
+    ) {
+        self.ctx.draw_image(image, rect, options);
+    }
+
     /// Draw text at the painter's centre using `style`. Convenience
     /// over `draw_text` + centre arithmetic.
     pub fn draw_text_centered(&mut self, text: &str, style: &TextStyle) {

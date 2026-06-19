@@ -2742,6 +2742,356 @@ fn voronoi(x: f32, y: f32, seed: u32) -> f32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// texture — generic image / texture visualiser. Accepts either a
+// host-loaded `ImageId` (cheap; the GPU keeps the texture in its
+// asset cache) or a raw RGBA byte slice (re-uploaded each frame
+// via `draw_rgba_pixels`). Mirrors CSS `object-fit` for stretch /
+// contain / cover behaviour against the painter rect.
+// ─────────────────────────────────────────────────────────────────────
+
+/// How the image fills the painter rect when the source aspect
+/// ratio doesn't match. Variants follow CSS `object-fit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextureFit {
+    /// Stretch the source to exactly fill the rect; aspect
+    /// ratio may distort.
+    #[default]
+    Fill,
+    /// Scale uniformly so the source fits entirely inside the
+    /// rect; letterbox margins appear when aspect mismatches.
+    Contain,
+    /// Scale uniformly so the source covers the rect; crop
+    /// when aspect mismatches.
+    Cover,
+    /// Same as `Contain` but never up-scale beyond the source's
+    /// native size — small images paint at 1:1 inside the rect.
+    ScaleDown,
+}
+
+/// Source data for the texture widget.
+///
+/// The lifetime `'src` ties the borrowed RGBA buffer to its owner
+/// so the painter can copy without lifetime gymnastics; ImageId
+/// variants are `Copy`-cheap.
+pub enum TextureSource<'src> {
+    /// Host-loaded asset — `ImageId` from `blinc_image` /
+    /// `blinc_layout::ImageLoader`. The GPU keeps the texture
+    /// cached across frames; cheap to repaint.
+    Id(blinc_core::draw::ImageId),
+    /// Raw RGBA byte buffer + dimensions. Re-uploaded every
+    /// frame via `draw_rgba_pixels` (the GPU clones the slice
+    /// each call). Use for procedural / dynamic textures; for
+    /// static images prefer the host loader + `Id`.
+    Rgba {
+        data: &'src [u8],
+        width: u32,
+        height: u32,
+    },
+}
+
+#[must_use = "TextureBuilder is lazy — call .show() to paint"]
+pub struct TextureBuilder<'a, 'b, 'src> {
+    ui: &'b mut PortalUi<'a>,
+    source: TextureSource<'src>,
+    width_override: Option<f32>,
+    height_override: Option<f32>,
+    fit: TextureFit,
+    tint: Option<Color>,
+    opacity: f32,
+    show_border: bool,
+    background: Option<Color>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+    pip: bool,
+}
+
+impl<'a, 'b, 'src> ShadowMix for TextureBuilder<'a, 'b, 'src> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b, 'src> TextureBuilder<'a, 'b, 'src> {
+    pub fn fit(mut self, f: TextureFit) -> Self {
+        self.fit = f;
+        self
+    }
+    pub fn contain(mut self) -> Self {
+        self.fit = TextureFit::Contain;
+        self
+    }
+    pub fn cover(mut self) -> Self {
+        self.fit = TextureFit::Cover;
+        self
+    }
+    pub fn fill(mut self) -> Self {
+        self.fit = TextureFit::Fill;
+        self
+    }
+    pub fn scale_down(mut self) -> Self {
+        self.fit = TextureFit::ScaleDown;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.height_override = Some(h);
+        self
+    }
+    pub fn tint(mut self, c: Color) -> Self {
+        self.tint = Some(c);
+        self
+    }
+    pub fn opacity(mut self, o: f32) -> Self {
+        self.opacity = o.clamp(0.0, 1.0);
+        self
+    }
+    pub fn show_border(mut self, b: bool) -> Self {
+        self.show_border = b;
+        self
+    }
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::draw::ImageOptions;
+        use blinc_core::layer::{CornerRadius, Rect};
+
+        let TextureBuilder {
+            ui,
+            source,
+            width_override,
+            height_override,
+            fit,
+            tint,
+            opacity,
+            show_border,
+            background,
+            disabled,
+            shadow_token,
+            pip,
+        } = self;
+
+        let style = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(96.0, 240.0));
+        let height = height_override.unwrap_or(80.0);
+
+        let (src_w, src_h) = match &source {
+            TextureSource::Rgba { width, height, .. } => (*width as f32, *height as f32),
+            TextureSource::Id(_) => (width, height),
+        };
+
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else {
+            Sense::None
+        };
+        let pip_strip = if pip && !disabled { 24.0 } else { 0.0 };
+        let alloc_h = height + pip_strip;
+        let (mut p, mut resp) = ui.allocate_painter((width, alloc_h), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+
+        let img_x = p.rect().x();
+        let img_y = p.rect().y() + pip_strip;
+        let outer = Rect::new(img_x, img_y, width, height);
+        if let Some(bg) = background {
+            let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+            p.fill_rect(outer, CornerRadius::uniform(4.0), Brush::Solid(bg));
+        }
+
+        // Compute dest rect from `fit`. Pure aspect-ratio math.
+        let aspect_src = if src_h > 0.0 { src_w / src_h } else { 1.0 };
+        let aspect_dst = if height > 0.0 { width / height } else { 1.0 };
+        let dest = match fit {
+            TextureFit::Fill => outer,
+            TextureFit::Contain => {
+                if aspect_src > aspect_dst {
+                    // Source wider than dst — letterbox top + bottom.
+                    let dw = width;
+                    let dh = width / aspect_src;
+                    Rect::new(img_x, img_y + (height - dh) * 0.5, dw, dh)
+                } else {
+                    let dh = height;
+                    let dw = height * aspect_src;
+                    Rect::new(img_x + (width - dw) * 0.5, img_y, dw, dh)
+                }
+            }
+            TextureFit::Cover => {
+                if aspect_src > aspect_dst {
+                    // Source wider than dst — fit height, crop sides.
+                    let dh = height;
+                    let dw = height * aspect_src;
+                    Rect::new(img_x + (width - dw) * 0.5, img_y, dw, dh)
+                } else {
+                    let dw = width;
+                    let dh = width / aspect_src;
+                    Rect::new(img_x, img_y + (height - dh) * 0.5, dw, dh)
+                }
+            }
+            TextureFit::ScaleDown => {
+                // Contain when src exceeds dst on either axis;
+                // 1:1 centered otherwise.
+                if src_w <= width && src_h <= height {
+                    Rect::new(
+                        img_x + (width - src_w) * 0.5,
+                        img_y + (height - src_h) * 0.5,
+                        src_w,
+                        src_h,
+                    )
+                } else if aspect_src > aspect_dst {
+                    let dw = width;
+                    let dh = width / aspect_src;
+                    Rect::new(img_x, img_y + (height - dh) * 0.5, dw, dh)
+                } else {
+                    let dh = height;
+                    let dw = height * aspect_src;
+                    Rect::new(img_x + (width - dw) * 0.5, img_y, dw, dh)
+                }
+            }
+        };
+
+        let effective_opacity = if disabled { opacity * 0.5 } else { opacity };
+        match source {
+            TextureSource::Rgba {
+                data,
+                width: w,
+                height: h,
+            } => {
+                p.draw_rgba_pixels(data, w, h, dest);
+            }
+            TextureSource::Id(id) => {
+                let mut opts = ImageOptions::new().with_opacity(effective_opacity);
+                if let Some(c) = tint {
+                    opts = opts.with_tint(c);
+                }
+                p.draw_image(id, dest, &opts);
+            }
+        }
+
+        if show_border {
+            p.stroke_rect(
+                outer,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(style.field_border),
+            );
+        }
+
+        // PiP corner button — same shape as the chart / noise widgets.
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let pad = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+                let by = p.rect().y() + pad;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let pad = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+            let by = p.rect().y() + pad;
+            let btn_rect = Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (style.button_hover, style.field_border_focus, style.text_primary)
+            } else {
+                (style.background, style.field_border, style.text_secondary)
+            };
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
+            p.stroke_rect(
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
+            p.stroke_rect(
+                Rect::new(gx, gy, GW, GH),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            p.fill_rect(
+                Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
+        resp
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Inline texture / image viewer. Accepts a host-loaded
+    /// `ImageId` (cheap; cached by the GPU asset registry) or a
+    /// raw RGBA byte slice (re-uploaded each frame). Chain
+    /// `.contain()` / `.cover()` / `.fill()` / `.scale_down()`
+    /// for aspect-ratio behaviour, `.tint(...)` /
+    /// `.opacity(...)` (Id source only), `.show_border(false)` /
+    /// `.background(c)` for chrome, `.width()` / `.height()` for
+    /// sizing. PiP corner button via `.pip(true)`.
+    pub fn texture<'b, 'src>(
+        &'b mut self,
+        source: TextureSource<'src>,
+    ) -> TextureBuilder<'a, 'b, 'src> {
+        TextureBuilder {
+            ui: self,
+            source,
+            width_override: None,
+            height_override: None,
+            fit: TextureFit::default(),
+            tint: None,
+            opacity: 1.0,
+            show_border: true,
+            background: None,
+            disabled: false,
+            shadow_token: None,
+            pip: false,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // slider — horizontal, fixed width follows available size
 // ─────────────────────────────────────────────────────────────────────
 
