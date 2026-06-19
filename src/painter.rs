@@ -257,6 +257,5 @@ pub fn build_response(
         // hit-region is registered; callers using `build_response`
         // directly get the default.
         widget_id: Default::default(),
-        script_language: None,
     }
 }
