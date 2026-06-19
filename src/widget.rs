@@ -2451,7 +2451,10 @@ impl<'a, 'b> NoiseBuilder<'a, 'b> {
         let style = ui.style.clone();
         let (avail_w, _) = ui.available_size();
         let width = width_override.unwrap_or_else(|| avail_w.clamp(120.0, 240.0));
-        let height = height_override.unwrap_or(80.0);
+        // Default to a square — noise visualisations read better when
+        // both axes carry the same signal density. Callers can still
+        // force a non-square via `.height(N)`.
+        let height = height_override.unwrap_or(width);
 
         let sense = if pip && !disabled {
             Sense::Click
@@ -2888,7 +2891,9 @@ impl<'a, 'b, 'src> TextureBuilder<'a, 'b, 'src> {
         let style = ui.style.clone();
         let (avail_w, _) = ui.available_size();
         let width = width_override.unwrap_or_else(|| avail_w.clamp(96.0, 240.0));
-        let height = height_override.unwrap_or(80.0);
+        // Default to a square — texture previews aspect best at 1 : 1.
+        // Callers can force a non-square via `.height(N)`.
+        let height = height_override.unwrap_or(width);
 
         let (src_w, src_h) = match &source {
             TextureSource::Rgba { width, height, .. } => (*width as f32, *height as f32),
