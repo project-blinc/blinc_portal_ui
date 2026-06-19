@@ -236,6 +236,12 @@ pub struct Response {
     /// call counter and shift every later widget's id). Defaults to
     /// `WidgetId::default()` on `Response::empty()`.
     pub widget_id: WidgetId,
+    /// Set by widgets that paint a "picture-in-picture" corner icon
+    /// (charts, pie, radar) when the user clicks it. The host's
+    /// overlay-escape contract uses this to mount an expanded view
+    /// of the widget in a popover. `false` for every widget that
+    /// doesn't expose a PiP affordance.
+    pub pip_clicked: bool,
 }
 
 impl Response {
@@ -253,6 +259,7 @@ impl Response {
             pointer_local: None,
             drag_delta_local: Point::new(0.0, 0.0),
             widget_id: WidgetId::default(),
+            pip_clicked: false,
         }
     }
 

@@ -1205,6 +1205,16 @@ pub struct PieChartBuilder<'a, 'b> {
     background: Option<Color>,
     disabled: bool,
     shadow_token: Option<ShadowToken>,
+    /// Centre the pie horizontally inside the portal's available
+    /// width. Default `true` — the pie sits in the middle of the
+    /// content slot rather than flush-left.
+    center: bool,
+    /// Hover tooltip showing the slice's weight + percentage.
+    /// Default `true`.
+    tooltip: bool,
+    /// Optional unit suffix appended to the slice value in the
+    /// tooltip ("ms", "px", "%").
+    tooltip_unit: Option<String>,
 }
 
 impl<'a, 'b> ShadowMix for PieChartBuilder<'a, 'b> {
@@ -1258,8 +1268,29 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
         self.disabled = b;
         self
     }
+    /// Centre the pie horizontally inside the portal's available
+    /// width. Default `true`. Disable for hosts that already
+    /// position the pie via their own layout.
+    pub fn center(mut self, b: bool) -> Self {
+        self.center = b;
+        self
+    }
+    /// Toggle the hover tooltip — slice weight + share-of-total
+    /// pill painted near the cursor while pointing at a slice.
+    pub fn tooltip(mut self, b: bool) -> Self {
+        self.tooltip = b;
+        self
+    }
+    /// Trailing unit suffix shown after the slice value in the
+    /// tooltip ("ms", "px", "%").
+    pub fn tooltip_unit(mut self, u: impl Into<String>) -> Self {
+        self.tooltip_unit = Some(u.into());
+        self
+    }
 
     pub fn show(self) -> Response {
+        use blinc_core::layer::{CornerRadius, Rect};
+
         let PieChartBuilder {
             ui,
             value,
@@ -1270,13 +1301,31 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             background,
             disabled,
             shadow_token,
+            center,
+            tooltip,
+            tooltip_unit,
         } = self;
 
         let style = ui.style.clone();
         let d = diameter.unwrap_or(96.0);
         let weights: Vec<f32> = value.get();
 
-        let (mut p, resp) = ui.allocate_painter((d, d), Sense::None);
+        // When centring, allocate a painter as wide as the
+        // portal's available width and paint the pie centred
+        // inside it. Without this the pie sits flush-left in the
+        // content slot.
+        let (avail_w, _) = ui.available_size();
+        let alloc_w = if center {
+            avail_w.max(d).min(avail_w.max(d))
+        } else {
+            d
+        };
+        let sense = if tooltip && !disabled {
+            Sense::Hover
+        } else {
+            Sense::None
+        };
+        let (mut p, resp) = ui.allocate_painter((alloc_w, d), sense);
 
         if let Some(tok) = shadow_token {
             if !disabled {
@@ -1305,7 +1354,8 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             return resp;
         }
 
-        let cx = p.rect().x() + d * 0.5;
+        // Centre the pie within the allocated painter rect.
+        let cx = p.rect().x() + alloc_w * 0.5;
         let cy = p.rect().y() + d * 0.5;
         let outer_r = (d * 0.5) - 2.0;
         let inner_r = outer_r * inner_ratio;
@@ -1321,8 +1371,20 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
         };
 
         // Sweep slices CW from -PI/2 (top of pie at 12 o'clock).
+        // First pass — collect each visible slice's (data_idx,
+        // a0, a1, weight, color) so the paint loop has stable
+        // colour state and the tooltip hit-test below can reuse
+        // the same angular spans without re-running the
+        // accumulation.
         let two_pi = std::f32::consts::TAU;
         let start_offset = -std::f32::consts::FRAC_PI_2;
+        struct Slice {
+            weight: f32,
+            a0: f32,
+            a1: f32,
+            color: Color,
+        }
+        let mut spans: Vec<Slice> = Vec::with_capacity(weights.len());
         let mut acc = 0.0_f32;
         let mut slice_idx = 0;
         for (i, &w) in weights.iter().enumerate() {
@@ -1339,6 +1401,18 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
                 .map(|c| if disabled { c.with_alpha(0.4) } else { c })
                 .unwrap_or_else(|| default_color(slice_idx));
             slice_idx += 1;
+            let _ = i;
+            spans.push(Slice {
+                weight: w,
+                a0,
+                a1,
+                color,
+            });
+        }
+        for slice in &spans {
+            let a0 = slice.a0;
+            let a1 = slice.a1;
+            let color = slice.color;
 
             // Build slice path as a many-segment polygon — sample
             // the outer arc (and inner arc for donuts) at small
@@ -1387,20 +1461,16 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             p.fill_path(&path, Brush::Solid(color));
         }
 
-        // Slice-gap stroke pass — paint over the slice seams in the
-        // background colour. Only meaningful when a background was
-        // declared; transparent backgrounds get no gap (would punch
-        // a hole through to whatever sits below).
+        // Slice-gap stroke pass — paint over the slice seams in
+        // the background colour. Only meaningful when a
+        // background was declared; transparent backgrounds skip
+        // the gap (would punch a hole through to whatever sits
+        // below).
         if slice_gap > 0.0 {
             if let Some(bg) = background {
                 let bg = if disabled { bg.with_alpha(0.5) } else { bg };
-                let mut acc = 0.0_f32;
-                for &w in &weights {
-                    if !w.is_finite() || w <= 0.0 {
-                        continue;
-                    }
-                    let a = start_offset + acc / total * two_pi;
-                    acc += w;
+                for slice in &spans {
+                    let a = slice.a0;
                     let (sa, ca) = (a.sin(), a.cos());
                     let inner_pt =
                         Point::new(cx + inner_r.max(0.0) * ca, cy + inner_r.max(0.0) * sa);
@@ -1409,6 +1479,80 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
                         .move_to(inner_pt.x, inner_pt.y)
                         .line_to(outer_pt.x, outer_pt.y);
                     p.stroke_path(&gap_path, &Stroke::new(slice_gap), Brush::Solid(bg));
+                }
+            }
+        }
+
+        // ─── tooltip ──────────────────────────────────────────
+        // Hit-test the cursor against each slice. Convert
+        // `pointer_local` (relative to the painter rect) to
+        // polar coords around (cx, cy); if the radius is in
+        // `[inner_r, outer_r]` AND the angle is inside one of the
+        // slice's `[a0, a1]` ranges (normalised against the
+        // start_offset wrap), show a pill with the slice's
+        // weight + percentage near the cursor.
+        if tooltip && !disabled && resp.hovered {
+            if let Some(local) = resp.pointer_local {
+                let px_pt = p.rect().x() + local.x;
+                let py_pt = p.rect().y() + local.y;
+                let dx = px_pt - cx;
+                let dy = py_pt - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r >= inner_r && r <= outer_r + 0.5 {
+                    // atan2 returns in `[-PI, PI]`. Pie angles
+                    // start at `-PI/2` and increase by total
+                    // 2 PI; normalise the hit angle into a
+                    // monotonic sweep from the start_offset.
+                    let mut ang = dy.atan2(dx);
+                    while ang < start_offset {
+                        ang += two_pi;
+                    }
+                    let mut hit: Option<&Slice> = None;
+                    for slice in &spans {
+                        if ang >= slice.a0 && ang <= slice.a1 {
+                            hit = Some(slice);
+                            break;
+                        }
+                    }
+                    if let Some(slice) = hit {
+                        let pct = slice.weight / total * 100.0;
+                        let formatted = format!("{:.2}", slice.weight);
+                        let label = if let Some(ref u) = tooltip_unit {
+                            format!("{}{} ({:.0}%)", formatted, u, pct)
+                        } else {
+                            format!("{} ({:.0}%)", formatted, pct)
+                        };
+                        let pad_x = 6.0_f32;
+                        let pill_h = 18.0_f32;
+                        let label_w = approx_text_width(&label, &style);
+                        let pill_w = label_w + 2.0 * pad_x;
+                        let mut px_pill = px_pt + 12.0;
+                        let mut py_pill = py_pt - pill_h - 8.0;
+                        if px_pill + pill_w > p.rect().x() + p.rect().width() {
+                            px_pill = px_pt - 12.0 - pill_w;
+                        }
+                        if py_pill < p.rect().y() {
+                            py_pill = py_pt + 12.0;
+                        }
+                        p.fill_rect(
+                            Rect::new(px_pill, py_pill, pill_w, pill_h),
+                            CornerRadius::uniform(4.0),
+                            Brush::Solid(style.field_bg),
+                        );
+                        p.stroke_rect(
+                            Rect::new(px_pill, py_pill, pill_w, pill_h),
+                            CornerRadius::uniform(4.0),
+                            &Stroke::new(1.0),
+                            Brush::Solid(style.field_border),
+                        );
+                        let mut ts = text_style(&style, style.text_primary);
+                        ts.baseline = TextBaseline::Middle;
+                        p.draw_text(
+                            &label,
+                            &ts,
+                            Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                        );
+                    }
                 }
             }
         }
@@ -1446,6 +1590,9 @@ impl<'a> PortalUi<'a> {
             background: None,
             disabled: false,
             shadow_token: None,
+            center: true,
+            tooltip: true,
+            tooltip_unit: None,
         }
     }
 }
