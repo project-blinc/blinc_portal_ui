@@ -1260,8 +1260,6 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
     }
 
     pub fn show(self) -> Response {
-        use blinc_core::layer::Vec2;
-
         let PieChartBuilder {
             ui,
             value,
@@ -1311,8 +1309,6 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
         let cy = p.rect().y() + d * 0.5;
         let outer_r = (d * 0.5) - 2.0;
         let inner_r = outer_r * inner_ratio;
-        let outer_radii = Vec2::new(outer_r, outer_r);
-        let inner_radii = Vec2::new(inner_r, inner_r);
         let alpha = if disabled { 0.4 } else { 1.0 };
         let (h0, _s0, _v0, _a0) = style.accent.to_hsva();
 
@@ -1344,34 +1340,49 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
                 .unwrap_or_else(|| default_color(slice_idx));
             slice_idx += 1;
 
-            // Build slice path: from inner-start, out to outer-
-            // start, arc CW to outer-end, in to inner-end, arc CCW
-            // back to inner-start. Reduces to a wedge from the
-            // centre when inner_r == 0.
-            let (sa, ca) = (a0.sin(), a0.cos());
-            let (sb, cb) = (a1.sin(), a1.cos());
-            let outer_start = Point::new(cx + outer_r * ca, cy + outer_r * sa);
-            let outer_end = Point::new(cx + outer_r * cb, cy + outer_r * sb);
-            // arc_to needs the large-arc flag set when the arc
-            // exceeds half a turn (a slice with > 50% of the pie).
-            let large = (a1 - a0).abs() > std::f32::consts::PI;
+            // Build slice path as a many-segment polygon — sample
+            // the outer arc (and inner arc for donuts) at small
+            // steps and emit `line_to` per vertex. Avoids
+            // `arc_to`'s SVG center-resolution math which was
+            // producing self-intersecting petal shapes at pie
+            // scales (single arc spanning >> 90°); a polygon with
+            // 1° steps reads as a smooth disk at common chart
+            // sizes (96 × 96 px) without any tessellation surprises.
+            let span = a1 - a0;
+            let steps = ((span.abs().to_degrees() as i32).max(8) as usize).max(8);
+            let step_da = span / steps as f32;
             let mut path = blinc_core::draw::Path::new();
             if inner_r > 0.0 {
-                let inner_start = Point::new(cx + inner_r * ca, cy + inner_r * sa);
-                let inner_end = Point::new(cx + inner_r * cb, cy + inner_r * sb);
-                path = path
-                    .move_to(inner_start.x, inner_start.y)
-                    .line_to(outer_start.x, outer_start.y)
-                    .arc_to(outer_radii, 0.0, large, true, outer_end.x, outer_end.y)
-                    .line_to(inner_end.x, inner_end.y)
-                    .arc_to(inner_radii, 0.0, large, false, inner_start.x, inner_start.y)
-                    .close();
+                // Donut wedge — walk outer CW, inner CCW back.
+                let a = a0;
+                let inner_start =
+                    Point::new(cx + inner_r * a.cos(), cy + inner_r * a.sin());
+                path = path.move_to(inner_start.x, inner_start.y);
+                // Outer arc (a0 → a1), step by step.
+                for k in 0..=steps {
+                    let ak = a0 + step_da * k as f32;
+                    let x = cx + outer_r * ak.cos();
+                    let y = cy + outer_r * ak.sin();
+                    path = path.line_to(x, y);
+                }
+                // Inner arc back (a1 → a0), step by step.
+                for k in 0..=steps {
+                    let ak = a1 - step_da * k as f32;
+                    let x = cx + inner_r * ak.cos();
+                    let y = cy + inner_r * ak.sin();
+                    path = path.line_to(x, y);
+                }
+                path = path.close();
             } else {
-                path = path
-                    .move_to(cx, cy)
-                    .line_to(outer_start.x, outer_start.y)
-                    .arc_to(outer_radii, 0.0, large, true, outer_end.x, outer_end.y)
-                    .close();
+                // Solid-pie wedge — centre → outer arc → centre.
+                path = path.move_to(cx, cy);
+                for k in 0..=steps {
+                    let ak = a0 + step_da * k as f32;
+                    let x = cx + outer_r * ak.cos();
+                    let y = cy + outer_r * ak.sin();
+                    path = path.line_to(x, y);
+                }
+                path = path.close();
             }
             p.fill_path(&path, Brush::Solid(color));
         }
