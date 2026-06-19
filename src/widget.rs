@@ -2313,6 +2313,435 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// noise — procedural 2D pattern visualiser. Hash-based Perlin /
+// Worley / Voronoi all reduced to a Vec<u8> RGBA buffer uploaded
+// via `draw_rgba_pixels`. Useful for game-tooling shaders, audio
+// noise floors, terrain previews.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Choice of procedural noise function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub enum NoiseVariant {
+    /// Smooth gradient noise — Perlin-style, value is interpolated
+    /// dot-products of pseudo-random gradient vectors at a unit
+    /// grid. Default.
+    #[default]
+    Perlin,
+    /// Cellular distance noise — distance from each pixel to its
+    /// nearest feature point. Produces a "cracked-stone" pattern;
+    /// useful for tile / mosaic effects.
+    Worley,
+    /// Voronoi cells — same feature points as Worley, but the
+    /// value is the cell id (each cell flat-shaded). Produces
+    /// a stained-glass / cellular look.
+    Voronoi,
+}
+
+#[must_use = "NoiseBuilder is lazy — call .show() to paint"]
+pub struct NoiseBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    variant: NoiseVariant,
+    /// Pseudo-random seed for the noise hash. Same seed +
+    /// variant + scale gives the same pattern every paint.
+    seed: u32,
+    /// Scale — pixels per noise unit. Smaller = coarser
+    /// pattern; larger = finer. Default 32 (one cell every
+    /// 32 px for Worley / Voronoi).
+    scale: f32,
+    /// Octaves for Perlin (1 = single-octave, 4 = fbm-style).
+    /// Ignored for Worley / Voronoi.
+    octaves: u32,
+    width_override: Option<f32>,
+    height_override: Option<f32>,
+    /// Optional colour ramp for Perlin — `(low, high)`. Each
+    /// pixel's noise value (mapped to 0..1) interpolates between
+    /// the two colours. `None` uses `style.field_bg` →
+    /// `style.text_primary`.
+    color_low: Option<Color>,
+    color_high: Option<Color>,
+    /// Optional border around the painter rect — same field
+    /// border colour as other portal_ui widgets.
+    show_border: bool,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+    pip: bool,
+}
+
+impl<'a, 'b> ShadowMix for NoiseBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> NoiseBuilder<'a, 'b> {
+    pub fn variant(mut self, v: NoiseVariant) -> Self {
+        self.variant = v;
+        self
+    }
+    pub fn perlin(mut self) -> Self {
+        self.variant = NoiseVariant::Perlin;
+        self
+    }
+    pub fn worley(mut self) -> Self {
+        self.variant = NoiseVariant::Worley;
+        self
+    }
+    pub fn voronoi(mut self) -> Self {
+        self.variant = NoiseVariant::Voronoi;
+        self
+    }
+    pub fn seed(mut self, s: u32) -> Self {
+        self.seed = s;
+        self
+    }
+    pub fn scale(mut self, s: f32) -> Self {
+        self.scale = s.max(1.0);
+        self
+    }
+    pub fn octaves(mut self, o: u32) -> Self {
+        self.octaves = o.clamp(1, 6);
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.height_override = Some(h);
+        self
+    }
+    pub fn color_ramp(mut self, low: Color, high: Color) -> Self {
+        self.color_low = Some(low);
+        self.color_high = Some(high);
+        self
+    }
+    pub fn show_border(mut self, b: bool) -> Self {
+        self.show_border = b;
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::layer::{CornerRadius, Rect};
+
+        let NoiseBuilder {
+            ui,
+            variant,
+            seed,
+            scale,
+            octaves,
+            width_override,
+            height_override,
+            color_low,
+            color_high,
+            show_border,
+            disabled,
+            shadow_token,
+            pip,
+        } = self;
+
+        let style = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(120.0, 240.0));
+        let height = height_override.unwrap_or(80.0);
+
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else {
+            Sense::None
+        };
+        let pip_strip = if pip && !disabled { 24.0 } else { 0.0 };
+        let alloc_h = height + pip_strip;
+        let (mut p, mut resp) = ui.allocate_painter((width, alloc_h), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+
+        // Image rect — the painter region below the PiP strip.
+        let img_x = p.rect().x();
+        let img_y = p.rect().y() + pip_strip;
+        let img_w = width;
+        let img_h = height;
+        // Quantise to integer pixels so the GPU image upload
+        // matches the texture sampling grid.
+        let tex_w = img_w.max(8.0).round() as u32;
+        let tex_h = img_h.max(8.0).round() as u32;
+
+        let (low, high) = (
+            color_low.unwrap_or_else(|| style.field_bg),
+            color_high.unwrap_or_else(|| style.text_primary),
+        );
+        let buf = generate_noise(variant, tex_w, tex_h, scale, seed, octaves, low, high);
+        let dest = Rect::new(img_x, img_y, img_w, img_h);
+        p.draw_rgba_pixels(&buf, tex_w, tex_h, dest);
+
+        if show_border {
+            p.stroke_rect(
+                dest,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(style.field_border),
+            );
+        }
+
+        // PiP corner button — same shape as the chart builders.
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let pad = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+                let by = p.rect().y() + pad;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let pad = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+            let by = p.rect().y() + pad;
+            let btn_rect = Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (style.button_hover, style.field_border_focus, style.text_primary)
+            } else {
+                (style.background, style.field_border, style.text_secondary)
+            };
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
+            p.stroke_rect(
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
+            p.stroke_rect(
+                Rect::new(gx, gy, GW, GH),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            p.fill_rect(
+                Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
+        resp
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Procedural 2D noise pattern — Perlin / Worley / Voronoi.
+    /// Bakes a pixel buffer each frame from the variant + seed +
+    /// scale and uploads it via `draw_rgba_pixels`. Useful for
+    /// game-tool noise previews, terrain editors, audio noise
+    /// floors. Chain `.perlin()` / `.worley()` / `.voronoi()` to
+    /// pick the kernel; `.seed(...)` / `.scale(...)` /
+    /// `.octaves(...)` / `.color_ramp(low, high)` to configure
+    /// the look; `.width(...)` / `.height(...)` for sizing.
+    pub fn noise<'b>(&'b mut self) -> NoiseBuilder<'a, 'b> {
+        NoiseBuilder {
+            ui: self,
+            variant: NoiseVariant::default(),
+            seed: 0,
+            scale: 32.0,
+            octaves: 1,
+            width_override: None,
+            height_override: None,
+            color_low: None,
+            color_high: None,
+            show_border: true,
+            disabled: false,
+            shadow_token: None,
+            pip: false,
+        }
+    }
+}
+
+// Hash-based noise generator. Single Vec<u8> RGBA output for the
+// painter to upload via `draw_rgba_pixels`. Pure CPU; called once
+// per paint. At default 240 × 80 sizes (~19 200 pixels) the cost
+// is well under a frame at 60 Hz.
+fn generate_noise(
+    variant: NoiseVariant,
+    w: u32,
+    h: u32,
+    scale: f32,
+    seed: u32,
+    octaves: u32,
+    low: Color,
+    high: Color,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let t = match variant {
+                NoiseVariant::Perlin => perlin_fbm(x as f32 / scale, y as f32 / scale, seed, octaves),
+                NoiseVariant::Worley => worley(x as f32 / scale, y as f32 / scale, seed),
+                NoiseVariant::Voronoi => voronoi(x as f32 / scale, y as f32 / scale, seed),
+            };
+            let t = t.clamp(0.0, 1.0);
+            let r = (low.r + (high.r - low.r) * t).clamp(0.0, 1.0);
+            let g = (low.g + (high.g - low.g) * t).clamp(0.0, 1.0);
+            let b = (low.b + (high.b - low.b) * t).clamp(0.0, 1.0);
+            let i = ((y * w + x) * 4) as usize;
+            buf[i] = (r * 255.0) as u8;
+            buf[i + 1] = (g * 255.0) as u8;
+            buf[i + 2] = (b * 255.0) as u8;
+            buf[i + 3] = 255;
+        }
+    }
+    buf
+}
+
+fn hash2(x: i32, y: i32, seed: u32) -> u32 {
+    let mut h = (x as u32)
+        .wrapping_mul(374761393)
+        .wrapping_add((y as u32).wrapping_mul(668265263))
+        .wrapping_add(seed.wrapping_mul(2246822519));
+    h ^= h >> 13;
+    h = h.wrapping_mul(1274126177);
+    h ^= h >> 16;
+    h
+}
+
+fn rand_unit(h: u32) -> f32 {
+    ((h >> 8) as f32) / ((1u32 << 24) as f32)
+}
+
+fn smoothstep(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+// 2D value-grid Perlin-like — gradient interpolation between
+// pseudo-random unit vectors at lattice corners. Single octave;
+// fbm wrapper combines multiple octaves with falling amplitude.
+fn perlin_single(x: f32, y: f32, seed: u32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let xf = x - xi as f32;
+    let yf = y - yi as f32;
+    let u = smoothstep(xf);
+    let v = smoothstep(yf);
+
+    let grad = |gx: i32, gy: i32, px: f32, py: f32| -> f32 {
+        let h = hash2(gx, gy, seed);
+        let ang = rand_unit(h) * std::f32::consts::TAU;
+        let dx = ang.cos();
+        let dy = ang.sin();
+        dx * px + dy * py
+    };
+
+    let a = grad(xi, yi, xf, yf);
+    let b = grad(xi + 1, yi, xf - 1.0, yf);
+    let c = grad(xi, yi + 1, xf, yf - 1.0);
+    let d = grad(xi + 1, yi + 1, xf - 1.0, yf - 1.0);
+
+    let ab = a + (b - a) * u;
+    let cd = c + (d - c) * u;
+    let v = ab + (cd - ab) * v;
+    // Gradient noise lands in roughly [-0.707, 0.707]; remap.
+    (v + 0.707) / 1.414
+}
+
+fn perlin_fbm(x: f32, y: f32, seed: u32, octaves: u32) -> f32 {
+    let mut amp = 1.0_f32;
+    let mut freq = 1.0_f32;
+    let mut sum = 0.0_f32;
+    let mut norm = 0.0_f32;
+    for o in 0..octaves {
+        sum += perlin_single(x * freq, y * freq, seed.wrapping_add(o.wrapping_mul(1013))) * amp;
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    (sum / norm).clamp(0.0, 1.0)
+}
+
+// Worley / cellular distance — distance from (x, y) to the
+// nearest feature point. Feature points sit one-per-cell in the
+// integer lattice; we scan the 3 × 3 neighbourhood around the
+// query cell so the nearest point is always within the window.
+fn worley(x: f32, y: f32, seed: u32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let mut best = f32::INFINITY;
+    for ny in -1..=1 {
+        for nx in -1..=1 {
+            let cx = xi + nx;
+            let cy = yi + ny;
+            let h = hash2(cx, cy, seed);
+            let fx = (cx as f32) + rand_unit(h);
+            let fy = (cy as f32) + rand_unit(h.wrapping_mul(2654435761));
+            let dx = fx - x;
+            let dy = fy - y;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d < best {
+                best = d;
+            }
+        }
+    }
+    best.clamp(0.0, 1.0)
+}
+
+// Voronoi cell colouring — same feature points as Worley, but
+// the value is a hash of the nearest cell's id (each cell renders
+// at a single flat shade).
+fn voronoi(x: f32, y: f32, seed: u32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let mut best = f32::INFINITY;
+    let mut best_h = 0u32;
+    for ny in -1..=1 {
+        for nx in -1..=1 {
+            let cx = xi + nx;
+            let cy = yi + ny;
+            let h = hash2(cx, cy, seed);
+            let fx = (cx as f32) + rand_unit(h);
+            let fy = (cy as f32) + rand_unit(h.wrapping_mul(2654435761));
+            let dx = fx - x;
+            let dy = fy - y;
+            let d = dx * dx + dy * dy;
+            if d < best {
+                best = d;
+                best_h = h;
+            }
+        }
+    }
+    rand_unit(best_h)
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // slider — horizontal, fixed width follows available size
 // ─────────────────────────────────────────────────────────────────────
 

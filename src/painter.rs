@@ -89,6 +89,16 @@ impl<'a> PortalPainter<'a> {
         self.ctx.draw_text(text, origin, style);
     }
 
+    /// Upload a raw RGBA pixel buffer into the given `dest` rect.
+    /// The GPU backend clones the slice and registers it as a
+    /// dynamic image for that frame; rendering cost scales with
+    /// the destination area. Use for procedural patterns
+    /// (noise, gradients) that don't fit the SDF / path
+    /// primitive set.
+    pub fn draw_rgba_pixels(&mut self, data: &[u8], width: u32, height: u32, dest: Rect) {
+        self.ctx.draw_rgba_pixels(data, width, height, dest);
+    }
+
     /// Draw text at the painter's centre using `style`. Convenience
     /// over `draw_text` + centre arithmetic.
     pub fn draw_text_centered(&mut self, text: &str, style: &TextStyle) {
