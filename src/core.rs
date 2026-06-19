@@ -236,6 +236,12 @@ pub struct Response {
     /// call counter and shift every later widget's id). Defaults to
     /// `WidgetId::default()` on `Response::empty()`.
     pub widget_id: WidgetId,
+    /// Cosmetic language hint set by widgets that paint a code-flavoured
+    /// chip (`script_editor`). Plumbed through so the host overlay
+    /// helper can pick a `SyntaxConfig` from a flat string without
+    /// portal_ui pulling in `blinc_layout::syntax`. `None` for every
+    /// widget that doesn't carry a language.
+    pub script_language: Option<&'static str>,
 }
 
 impl Response {
@@ -253,6 +259,7 @@ impl Response {
             pointer_local: None,
             drag_delta_local: Point::new(0.0, 0.0),
             widget_id: WidgetId::default(),
+            script_language: None,
         }
     }
 

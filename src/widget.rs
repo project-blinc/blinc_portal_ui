@@ -1842,6 +1842,182 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// script_editor — inline-script trigger chip. Paints a `{ }` glyph + a
+// one-line preview of the bound source code + an "+N more" suffix when
+// the script spans multiple lines. The host opens an overlay popover
+// hosting a `blinc_layout::code_editor` bound to the same signal — same
+// overlay-escape contract as `color_picker` / `select_trigger`. The
+// portal_ui crate never depends on `blinc_layout::syntax` directly; the
+// language is stored as a flat string and resolved to a concrete
+// `SyntaxConfig` by the host helper that mounts the overlay.
+// ─────────────────────────────────────────────────────────────────────
+
+#[must_use = "ScriptEditorBuilder is lazy — call .show() / .clicked() to paint"]
+pub struct ScriptEditorBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, String>,
+    language: Option<&'static str>,
+    width_override: Option<f32>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for ScriptEditorBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> ScriptEditorBuilder<'a, 'b> {
+    /// Cosmetic language hint (`"lua"`, `"rust"`, `"json"`, …). Stored
+    /// as a flat string and surfaced via [`Response::script_language`]
+    /// so the host overlay helper can choose a [`SyntaxHighlighter`]
+    /// without portal_ui pulling in the syntax module.
+    pub fn language(mut self, lang: &'static str) -> Self {
+        self.language = Some(lang);
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        let ScriptEditorBuilder {
+            ui,
+            value,
+            language,
+            width_override,
+            disabled,
+            shadow_token,
+        } = self;
+        let style = ui.style.clone();
+        let height = style.control_height;
+        let src = value.get();
+        let line_count = src.lines().count().max(1);
+        // First non-blank line as the preview, fall back to the
+        // literal first line so a script that starts with `\n` still
+        // conveys "this isn't empty".
+        let first_line = src
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .or_else(|| src.lines().next())
+            .unwrap_or("")
+            .to_string();
+        let suffix = if line_count > 1 {
+            format!(" +{} more", line_count - 1)
+        } else {
+            String::new()
+        };
+        let preview = format!("{}{}", first_line, suffix);
+
+        // 4 px grid: left pad 4, glyph 12, glyph→label gap 4, label,
+        // right pad 12.
+        let preview_w = text_width(&preview, &style);
+        let glyph_w = text_width("{ }", &style);
+        let default_w = 4.0 + glyph_w + 4.0 + preview_w.max(96.0) + 12.0;
+        let width = width_override.unwrap_or(default_w);
+
+        let sense = if disabled { Sense::Hover } else { Sense::Click };
+        let (mut p, mut resp) = ui.allocate_painter((width, height), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+
+        let bg = if disabled {
+            style.field_bg.with_alpha(0.5)
+        } else if resp.pressed {
+            style.button_pressed
+        } else if resp.hovered {
+            style.button_hover
+        } else {
+            style.field_bg
+        };
+        let border = if resp.hovered && !disabled {
+            style.field_border_focus
+        } else {
+            style.field_border
+        };
+        p.fill_self(&style, Brush::Solid(bg));
+        p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
+
+        // `{ }` glyph anchor — secondary-coloured so the eye lands on
+        // the preview text first.
+        let glyph_x = p.rect().x() + 4.0;
+        let mid_y = p.rect().y() + height * 0.5;
+        let mut gs = text_style(&style, style.text_secondary);
+        gs.baseline = TextBaseline::Middle;
+        p.draw_text("{ }", &gs, Point::new(glyph_x, mid_y));
+
+        let label_x = glyph_x + glyph_w + 4.0;
+        let label_color = if disabled {
+            style.text_disabled
+        } else {
+            style.text_primary
+        };
+        let mut ts = text_style(&style, label_color);
+        ts.baseline = TextBaseline::Middle;
+        if !preview.is_empty() {
+            p.draw_text(&preview, &ts, Point::new(label_x, mid_y));
+        }
+
+        if disabled {
+            resp.clicked = false;
+            resp.pressed = false;
+        }
+        // Stamp the cosmetic language onto the response so the host
+        // overlay can pick a highlighter without re-passing it through
+        // a separate channel.
+        resp.script_language = language;
+        resp
+    }
+
+    pub fn clicked(self) -> bool {
+        self.show().clicked
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Paint an inline-script trigger chip bound to a code `String`.
+    /// Chain `.language(...)` / `.width(...)` / `.disabled(...)` /
+    /// `.shadow_*()` and terminate with `.show()` or `.clicked()`.
+    /// The host opens the editor popover when `resp.clicked` is true
+    /// by anchoring against `resp.rect` (see
+    /// [`crate::core::HostBridge::rect_to_screen`]) and mounting a
+    /// `blinc_layout::code_editor` bound to the same signal. The
+    /// language is delivered through `resp.script_language` so the
+    /// host can pick a `SyntaxConfig` — portal_ui never names a
+    /// concrete highlighter.
+    pub fn script_editor<'b, V: PortalValue<'b, String>>(
+        &'b mut self,
+        value: V,
+    ) -> ScriptEditorBuilder<'a, 'b> {
+        ScriptEditorBuilder {
+            ui: self,
+            value: value.into_binding(),
+            language: None,
+            width_override: None,
+            disabled: false,
+            shadow_token: None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // select_trigger — dropdown chip rendered as a button-styled field.
 // The widget paints the trigger and reports clicks; opening the
 // menu is the host's job (overlay-escape contract per the README's
