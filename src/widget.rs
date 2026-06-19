@@ -1057,22 +1057,24 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             }
         }
 
-        // ─── PiP corner icon ──────────────────────────────────
-        // Top-right corner glyph that signals the host to mount an
-        // expanded view of the chart. Click handoff: transfer
-        // resp.clicked → resp.pip_clicked when the cursor sits
-        // inside the icon's local rect at click time. Suppresses
-        // the chart's tooltip in that same region so the icon and
-        // the hover crosshair don't fight for screen space.
+        // ─── PiP corner button ────────────────────────────────
+        // Top-right corner affordance that signals the host to
+        // mount an expanded view of the chart. Wrapped in a 20-px
+        // button-style rect (field_bg + 1 px border) so the
+        // glyph reads as a distinct UI control even when the
+        // underlying data series overlaps it. Click handoff:
+        // transfer resp.clicked → resp.pip_clicked when the
+        // cursor sits inside the button at click time. The
+        // tooltip suppresses in that same region.
         let pointer_in_pip = if pip && !disabled {
             if let Some(local) = resp.pointer_local {
                 let lx = p.rect().x() + local.x;
                 let ly = p.rect().y() + local.y;
-                let icon_pad = 4.0_f32;
-                let icon_size = 16.0_f32;
-                let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
-                let iy = p.rect().y() + icon_pad;
-                lx >= ix && lx < ix + icon_size && ly >= iy && ly < iy + icon_size
+                let pad = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+                let by = p.rect().y() + pad;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
             } else {
                 false
             }
@@ -1080,26 +1082,40 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             false
         };
         if pip && !disabled {
-            let icon_pad = 4.0_f32;
-            let icon_size = 16.0_f32;
-            let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
-            let iy = p.rect().y() + icon_pad;
-            let icon_color = if pointer_in_pip {
-                style.text_primary
+            let pad = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+            let by = p.rect().y() + pad;
+            let btn_rect = blinc_core::layer::Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (style.button_hover, style.field_border_focus, style.text_primary)
             } else {
-                style.text_secondary
+                (style.field_bg, style.field_border, style.text_secondary)
             };
-            // PiP frame — outline of the outer screen.
+            // Button chrome — fills the chart bars behind so the
+            // PiP glyph reads as a separate control rather than
+            // ambiguous overlap.
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
             p.stroke_rect(
-                blinc_core::layer::Rect::new(ix + 1.0, iy + 3.0, 12.0, 9.0),
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            // PiP glyph centred inside the button — a 12 × 9
+            // outlined frame with a 5 × 4 fill tucked in the
+            // bottom-right corner, the canonical picture-in-
+            // picture mark.
+            let gx = bx + (btn_size - 12.0) * 0.5;
+            let gy = by + (btn_size - 12.0) * 0.5;
+            p.stroke_rect(
+                blinc_core::layer::Rect::new(gx, gy, 12.0, 9.0),
                 CornerRadius::uniform(1.5),
                 &Stroke::new(1.5),
                 Brush::Solid(icon_color),
             );
-            // PiP overlay — small rect tucked in the lower-right
-            // corner of the frame, the canonical glyph.
             p.fill_rect(
-                blinc_core::layer::Rect::new(ix + 7.0, iy + 8.0, 5.0, 4.0),
+                blinc_core::layer::Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
                 CornerRadius::uniform(1.0),
                 Brush::Solid(icon_color),
             );
@@ -1570,16 +1586,21 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             }
         }
 
-        // ─── PiP corner icon ──────────────────────────────────
+        // ─── PiP corner button ────────────────────────────────
+        // Same shape as ChartsBuilder's PiP: 20 × 20 button rect
+        // with field_bg + 1 px border so the glyph reads as a
+        // distinct control. Slice fills underneath stay visible
+        // around the corner; the button itself masks the slice
+        // wedge it overlaps so the icon never looks "stuck on".
         let pointer_in_pip = if pip && !disabled {
             if let Some(local) = resp.pointer_local {
                 let lx = p.rect().x() + local.x;
                 let ly = p.rect().y() + local.y;
-                let icon_pad = 4.0_f32;
-                let icon_size = 16.0_f32;
-                let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
-                let iy = p.rect().y() + icon_pad;
-                lx >= ix && lx < ix + icon_size && ly >= iy && ly < iy + icon_size
+                let pad = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+                let by = p.rect().y() + pad;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
             } else {
                 false
             }
@@ -1587,23 +1608,33 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             false
         };
         if pip && !disabled {
-            let icon_pad = 4.0_f32;
-            let icon_size = 16.0_f32;
-            let ix = p.rect().x() + p.rect().width() - icon_size - icon_pad;
-            let iy = p.rect().y() + icon_pad;
-            let icon_color = if pointer_in_pip {
-                style.text_primary
+            let pad = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+            let by = p.rect().y() + pad;
+            let btn_rect = Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (style.button_hover, style.field_border_focus, style.text_primary)
             } else {
-                style.text_secondary
+                (style.field_bg, style.field_border, style.text_secondary)
             };
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
             p.stroke_rect(
-                Rect::new(ix + 1.0, iy + 3.0, 12.0, 9.0),
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            let gx = bx + (btn_size - 12.0) * 0.5;
+            let gy = by + (btn_size - 12.0) * 0.5;
+            p.stroke_rect(
+                Rect::new(gx, gy, 12.0, 9.0),
                 CornerRadius::uniform(1.5),
                 &Stroke::new(1.5),
                 Brush::Solid(icon_color),
             );
             p.fill_rect(
-                Rect::new(ix + 7.0, iy + 8.0, 5.0, 4.0),
+                Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
                 CornerRadius::uniform(1.0),
                 Brush::Solid(icon_color),
             );
