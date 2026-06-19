@@ -29,8 +29,8 @@ pub use crate::core::{
 };
 pub use crate::widget::{
     ButtonBuilder, ChartDecimation, ChartVariant, ChartsBuilder, ColorPickerBuilder,
-    NumericInputBuilder, PieChartBuilder, SelectBuilder, SliderBuilder, SwitchBuilder,
-    TextInputBuilder,
+    NumericInputBuilder, PieChartBuilder, RadarChartBuilder, SelectBuilder, SliderBuilder,
+    SwitchBuilder, TextInputBuilder,
 };
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;

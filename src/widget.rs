@@ -841,7 +841,14 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         } else {
             Sense::None
         };
-        let (mut p, mut resp) = ui.allocate_painter((width, height), sense);
+        // Reserve a 24 px top strip when PiP is enabled — the
+        // button (20 px) + 4 px breathing room — so the icon
+        // never overlaps the data series. The painter height
+        // grows to absorb the strip so the visible plot area
+        // matches what the caller asked for.
+        let pip_strip = if pip && !disabled { 24.0 } else { 0.0 };
+        let alloc_h = height + pip_strip;
+        let (mut p, mut resp) = ui.allocate_painter((width, alloc_h), sense);
 
         if let Some(tok) = shadow_token {
             if !disabled {
@@ -860,12 +867,13 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         }
 
         // 4 px inner padding so series strokes don't kiss the
-        // painter rect edge.
+        // painter rect edge. PiP-enabled charts add `pip_strip`
+        // to the top so the icon button sits above the data.
         let pad = 4.0_f32;
         let plot_x = p.rect().x() + pad;
-        let plot_y = p.rect().y() + pad;
+        let plot_y = p.rect().y() + pad + pip_strip;
         let plot_w = (p.rect().width() - 2.0 * pad).max(0.0);
-        let plot_h = (p.rect().height() - 2.0 * pad).max(0.0);
+        let plot_h = (p.rect().height() - 2.0 * pad - pip_strip).max(0.0);
         if plot_w < 2.0 || plot_h < 2.0 || data.is_empty() {
             return resp;
         }
@@ -1762,6 +1770,537 @@ impl<'a> PortalUi<'a> {
             inner_ratio: 0.0,
             palette: None,
             slice_gap: 0.0,
+            background: None,
+            disabled: false,
+            shadow_token: None,
+            center: true,
+            tooltip: true,
+            tooltip_unit: None,
+            pip: false,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// radar_chart — polar-axis visualiser. Equally-spaced axes radiate
+// from a centre; data points sit along each axis proportional to
+// the value's share of the y range, connected into a polygon.
+// Distinct from the cartesian charts (line / bar / area / pie)
+// because the data shape is "N values along N axes", not a time
+// series and not slice weights.
+// ─────────────────────────────────────────────────────────────────────
+
+#[must_use = "RadarChartBuilder is lazy — call .show() / .changed() to paint"]
+pub struct RadarChartBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, Vec<f32>>,
+    /// Optional axis labels — same length as the data series; when
+    /// shorter or `None`, no labels paint. Labels render outside
+    /// the outer ring at each axis's angle.
+    labels: Option<Vec<String>>,
+    diameter: Option<f32>,
+    /// Override the radial value range. `None` → autoscale to
+    /// `[0, data.max()]`.
+    y_range: Option<std::ops::Range<f32>>,
+    /// Stroke width for the data polygon outline.
+    line_width: f32,
+    /// Concentric grid rings (`true` by default) — paint 4 evenly-
+    /// spaced rings at 25 / 50 / 75 / 100 % of the outer radius so
+    /// the eye can read approximate values along each axis.
+    show_grid: bool,
+    /// Axis spokes (`true` by default) — radial lines from centre
+    /// to outer ring at each axis's angle.
+    show_axes: bool,
+    /// Fill the data polygon with a translucent wash under the
+    /// stroke. Defaults `true`; turn off for an outline-only look.
+    fill_area: bool,
+    /// Show a small dot at each vertex of the data polygon.
+    show_vertices: bool,
+    /// Theme overrides — all default to derived theme tokens.
+    stroke_color: Option<Color>,
+    fill_color: Option<Color>,
+    grid_color: Option<Color>,
+    axis_color: Option<Color>,
+    background: Option<Color>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+    /// Centre the chart horizontally within the portal's
+    /// available width. Default `true`.
+    center: bool,
+    /// Hover tooltip — shows the value at the axis nearest the
+    /// cursor. Default `true`.
+    tooltip: bool,
+    /// Optional unit suffix in the tooltip.
+    tooltip_unit: Option<String>,
+    /// Picture-in-picture corner button. Default `false`.
+    pip: bool,
+}
+
+impl<'a, 'b> ShadowMix for RadarChartBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> RadarChartBuilder<'a, 'b> {
+    pub fn diameter(mut self, d: f32) -> Self {
+        self.diameter = Some(d.max(32.0));
+        self
+    }
+    pub fn labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = Some(labels);
+        self
+    }
+    pub fn y_range(mut self, r: std::ops::Range<f32>) -> Self {
+        self.y_range = Some(r);
+        self
+    }
+    pub fn line_width(mut self, w: f32) -> Self {
+        self.line_width = w.max(0.5);
+        self
+    }
+    pub fn show_grid(mut self, b: bool) -> Self {
+        self.show_grid = b;
+        self
+    }
+    pub fn show_axes(mut self, b: bool) -> Self {
+        self.show_axes = b;
+        self
+    }
+    pub fn fill_area(mut self, b: bool) -> Self {
+        self.fill_area = b;
+        self
+    }
+    pub fn show_vertices(mut self, b: bool) -> Self {
+        self.show_vertices = b;
+        self
+    }
+    pub fn stroke_color(mut self, c: Color) -> Self {
+        self.stroke_color = Some(c);
+        self
+    }
+    pub fn fill_color(mut self, c: Color) -> Self {
+        self.fill_color = Some(c);
+        self
+    }
+    pub fn grid_color(mut self, c: Color) -> Self {
+        self.grid_color = Some(c);
+        self
+    }
+    pub fn axis_color(mut self, c: Color) -> Self {
+        self.axis_color = Some(c);
+        self
+    }
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn center(mut self, b: bool) -> Self {
+        self.center = b;
+        self
+    }
+    pub fn tooltip(mut self, b: bool) -> Self {
+        self.tooltip = b;
+        self
+    }
+    pub fn tooltip_unit(mut self, u: impl Into<String>) -> Self {
+        self.tooltip_unit = Some(u.into());
+        self
+    }
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::draw::{LineCap, LineJoin};
+        use blinc_core::layer::{CornerRadius, Rect};
+
+        let RadarChartBuilder {
+            ui,
+            value,
+            labels,
+            diameter,
+            y_range,
+            line_width,
+            show_grid,
+            show_axes,
+            fill_area,
+            show_vertices,
+            stroke_color,
+            fill_color,
+            grid_color,
+            axis_color,
+            background,
+            disabled,
+            shadow_token,
+            center,
+            tooltip,
+            tooltip_unit,
+            pip,
+        } = self;
+
+        let style = ui.style.clone();
+        let d = diameter.unwrap_or(112.0);
+        let data: Vec<f32> = value.get();
+        let n = data.len();
+
+        let (avail_w, _) = ui.available_size();
+        let alloc_w = if center { avail_w.max(d) } else { d };
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else if tooltip && !disabled {
+            Sense::Hover
+        } else {
+            Sense::None
+        };
+        let (mut p, mut resp) = ui.allocate_painter((alloc_w, d), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+        if let Some(bg) = background {
+            let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+            p.fill_self(&style, Brush::Solid(bg));
+        }
+
+        // Need at least 3 axes for a polygon to read. Empty / 1 /
+        // 2 falls through to an empty paint (chart slot still
+        // occupies its rect for layout stability).
+        if n < 3 || d < 16.0 {
+            return resp;
+        }
+
+        // Geometry: leave a margin for axis labels if any. Without
+        // labels, leave a 6 px halo so the outer ring doesn't kiss
+        // the painter edge.
+        let label_margin = if labels.as_ref().map(|l| !l.is_empty()).unwrap_or(false) {
+            18.0
+        } else {
+            6.0
+        };
+        let cx = p.rect().x() + alloc_w * 0.5;
+        let cy = p.rect().y() + d * 0.5;
+        let outer_r = (d * 0.5) - label_margin;
+        if outer_r < 8.0 {
+            return resp;
+        }
+
+        // y-range autoscale — NaN-safe; default min = 0 (radial
+        // values typically start at the centre).
+        let mut hi = f32::NEG_INFINITY;
+        for &v in &data {
+            if v.is_finite() {
+                hi = hi.max(v);
+            }
+        }
+        let (lo, hi) = if !hi.is_finite() {
+            (0.0, 1.0)
+        } else if let Some(r) = y_range.clone() {
+            (r.start, r.end)
+        } else if hi.abs() < 1e-6 {
+            (0.0, 1.0)
+        } else {
+            (0.0, hi)
+        };
+        let span = (hi - lo).max(1e-6);
+
+        // Theme palette resolution.
+        let alpha = if disabled { 0.4 } else { 1.0 };
+        let stroke = stroke_color.unwrap_or(style.accent).with_alpha(alpha);
+        let fill = if let Some(fc) = fill_color {
+            fc.with_alpha(alpha)
+        } else {
+            style.accent.with_alpha(alpha * 0.18)
+        };
+        let grid_col = grid_color
+            .unwrap_or_else(|| style.field_border.with_alpha(alpha * 0.7));
+        let axis_col = axis_color
+            .unwrap_or_else(|| style.text_secondary.with_alpha(alpha * 0.35));
+
+        let two_pi = std::f32::consts::TAU;
+        let start_offset = -std::f32::consts::FRAC_PI_2;
+        let axis_angle = |i: usize| -> f32 {
+            start_offset + (i as f32) * two_pi / (n as f32)
+        };
+
+        // Grid rings — 4 concentric circles at 25/50/75/100 %.
+        if show_grid {
+            for k in 1..=4 {
+                let r = outer_r * (k as f32) * 0.25;
+                p.stroke_circle(
+                    Point::new(cx, cy),
+                    r,
+                    &Stroke::new(1.0),
+                    Brush::Solid(grid_col),
+                );
+            }
+        }
+
+        // Axis spokes.
+        if show_axes {
+            for i in 0..n {
+                let ang = axis_angle(i);
+                let ex = cx + outer_r * ang.cos();
+                let ey = cy + outer_r * ang.sin();
+                let spoke = blinc_core::draw::Path::new()
+                    .move_to(cx, cy)
+                    .line_to(ex, ey);
+                p.stroke_path(&spoke, &Stroke::new(1.0), Brush::Solid(axis_col));
+            }
+        }
+
+        // Data polygon — compute vertex per axis, walk path.
+        let mut vertices: Vec<Point> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = data[i];
+            let t = if v.is_finite() {
+                ((v - lo) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let r = outer_r * t;
+            let ang = axis_angle(i);
+            vertices.push(Point::new(cx + r * ang.cos(), cy + r * ang.sin()));
+        }
+
+        // Fill area (closed polygon) painted first; stroke on top.
+        if fill_area {
+            let mut area = blinc_core::draw::Path::new();
+            area = area.move_to(vertices[0].x, vertices[0].y);
+            for v in vertices.iter().skip(1) {
+                area = area.line_to(v.x, v.y);
+            }
+            area = area.close();
+            p.fill_path(&area, Brush::Solid(fill));
+        }
+
+        // Stroke the polygon outline.
+        let mut poly = blinc_core::draw::Path::new();
+        poly = poly.move_to(vertices[0].x, vertices[0].y);
+        for v in vertices.iter().skip(1) {
+            poly = poly.line_to(v.x, v.y);
+        }
+        poly = poly.line_to(vertices[0].x, vertices[0].y); // explicit close stroke
+        let stroke_def = Stroke::new(line_width)
+            .with_cap(LineCap::Round)
+            .with_join(LineJoin::Round);
+        p.stroke_path(&poly, &stroke_def, Brush::Solid(stroke));
+
+        // Vertex markers.
+        if show_vertices {
+            for v in &vertices {
+                p.fill_circle(*v, line_width + 1.0, Brush::Solid(stroke));
+            }
+        }
+
+        // Axis labels — outside the outer ring at each axis angle.
+        if let Some(ref labels) = labels {
+            let mut ts = text_style(&style, style.text_secondary.with_alpha(alpha));
+            ts.baseline = TextBaseline::Middle;
+            for (i, label) in labels.iter().enumerate().take(n) {
+                if label.is_empty() {
+                    continue;
+                }
+                let ang = axis_angle(i);
+                let lr = outer_r + 8.0;
+                let lx = cx + lr * ang.cos();
+                let ly = cy + lr * ang.sin();
+                // Right-align labels on the left half, left-align
+                // on the right half so they don't dive into the
+                // chart body.
+                let lw = approx_text_width(label, &style);
+                let lx = if ang.cos() < -0.2 {
+                    lx - lw
+                } else if ang.cos() < 0.2 {
+                    lx - lw * 0.5
+                } else {
+                    lx
+                };
+                p.draw_text(label, &ts, Point::new(lx, ly));
+            }
+        }
+
+        // ─── PiP corner button ────────────────────────────────
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let pad = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+                let by = p.rect().y() + pad;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let pad = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad;
+            let by = p.rect().y() + pad;
+            let btn_rect = Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (style.button_hover, style.field_border_focus, style.text_primary)
+            } else {
+                (style.background, style.field_border, style.text_secondary)
+            };
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
+            p.stroke_rect(
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
+            p.stroke_rect(
+                Rect::new(gx, gy, GW, GH),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            p.fill_rect(
+                Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
+        // ─── tooltip ──────────────────────────────────────────
+        // Pick the axis whose direction is closest to the cursor's
+        // direction-from-centre; show the value pill at the
+        // cursor.
+        if tooltip && !disabled && resp.hovered && !pointer_in_pip {
+            if let Some(local) = resp.pointer_local {
+                let px_pt = p.rect().x() + local.x;
+                let py_pt = p.rect().y() + local.y;
+                let dx = px_pt - cx;
+                let dy = py_pt - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r >= 1.0 && r <= outer_r + 8.0 {
+                    let cursor_ang = dy.atan2(dx);
+                    let mut best_i = 0usize;
+                    let mut best_d = f32::INFINITY;
+                    for i in 0..n {
+                        let ang = axis_angle(i);
+                        // Smallest unsigned angular distance.
+                        let diff = ((cursor_ang - ang).sin().abs()).atan2(
+                            (cursor_ang - ang).cos(),
+                        );
+                        let d = diff.abs();
+                        if d < best_d {
+                            best_d = d;
+                            best_i = i;
+                        }
+                    }
+                    let val = data[best_i];
+                    let label_pref = labels
+                        .as_ref()
+                        .and_then(|ls| ls.get(best_i).cloned())
+                        .filter(|s| !s.is_empty());
+                    let formatted = format!("{:.2}", val);
+                    let body = if let Some(ref u) = tooltip_unit {
+                        format!("{}{}", formatted, u)
+                    } else {
+                        formatted
+                    };
+                    let label_text = match label_pref {
+                        Some(name) => format!("{}: {}", name, body),
+                        None => body,
+                    };
+                    let pad_x = 6.0_f32;
+                    let pill_h = 18.0_f32;
+                    let label_w = approx_text_width(&label_text, &style);
+                    let pill_w = label_w + 2.0 * pad_x;
+                    let mut px_pill = px_pt + 12.0;
+                    let mut py_pill = py_pt - pill_h - 8.0;
+                    if px_pill + pill_w > p.rect().x() + p.rect().width() {
+                        px_pill = px_pt - 12.0 - pill_w;
+                    }
+                    if py_pill < p.rect().y() {
+                        py_pill = py_pt + 12.0;
+                    }
+                    p.fill_rect(
+                        Rect::new(px_pill, py_pill, pill_w, pill_h),
+                        CornerRadius::uniform(4.0),
+                        Brush::Solid(style.field_bg),
+                    );
+                    p.stroke_rect(
+                        Rect::new(px_pill, py_pill, pill_w, pill_h),
+                        CornerRadius::uniform(4.0),
+                        &Stroke::new(1.0),
+                        Brush::Solid(style.field_border),
+                    );
+                    let mut ts = text_style(&style, style.text_primary);
+                    ts.baseline = TextBaseline::Middle;
+                    p.draw_text(
+                        &label_text,
+                        &ts,
+                        Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                    );
+                }
+            }
+        }
+
+        resp
+    }
+
+    pub fn changed(self) -> bool {
+        self.show().changed
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Radar / spider chart — N values on N equally-spaced axes
+    /// radiating from a centre, connected into a polygon. Useful
+    /// for multi-dimensional metric comparisons (skills profile,
+    /// node-graph health vector, audio analyser bands).
+    ///
+    /// Chain `.diameter(...)` / `.labels(...)` / `.y_range(...)` /
+    /// `.fill_area(false)` / `.show_vertices(true)` / colour
+    /// overrides / `.tooltip(...)` / `.pip(...)` then `.show()`.
+    pub fn radar_chart<'b, V: PortalValue<'b, Vec<f32>>>(
+        &'b mut self,
+        values: V,
+    ) -> RadarChartBuilder<'a, 'b> {
+        RadarChartBuilder {
+            ui: self,
+            value: values.into_binding(),
+            labels: None,
+            diameter: None,
+            y_range: None,
+            line_width: 1.5,
+            show_grid: true,
+            show_axes: true,
+            fill_area: true,
+            show_vertices: false,
+            stroke_color: None,
+            fill_color: None,
+            grid_color: None,
+            axis_color: None,
             background: None,
             disabled: false,
             shadow_token: None,
