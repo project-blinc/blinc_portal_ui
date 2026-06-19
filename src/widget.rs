@@ -662,6 +662,18 @@ pub struct ChartsBuilder<'a, 'b> {
     background: Option<Color>,
     disabled: bool,
     shadow_token: Option<ShadowToken>,
+    /// Hover tooltip showing the data value at the cursor's x.
+    /// Defaults `true` — a hover crosshair + value pill render
+    /// when the pointer is over the plot area. Disable for
+    /// strictly passive sparklines.
+    tooltip: bool,
+    /// Decimal precision for the tooltip's number formatting.
+    /// `None` picks a sensible default from the data range
+    /// (`< 1` → 3 dp, `< 100` → 2 dp, else 1 dp).
+    tooltip_precision: Option<u8>,
+    /// Optional unit suffix appended to the tooltip number
+    /// ("ms", "px", "%").
+    tooltip_unit: Option<String>,
 }
 
 impl<'a, 'b> ShadowMix for ChartsBuilder<'a, 'b> {
@@ -745,6 +757,28 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         self.disabled = b;
         self
     }
+    /// Toggle the hover-tooltip pass — a crosshair + value pill
+    /// painted near the cursor when the pointer is over the
+    /// chart. Defaults `true` for charts; `false` if the host
+    /// wants a strictly passive sparkline.
+    pub fn tooltip(mut self, b: bool) -> Self {
+        self.tooltip = b;
+        self
+    }
+    /// Decimal precision used to format the tooltip's value. By
+    /// default the precision is chosen from the data range
+    /// (3 dp below 1, 2 dp below 100, 1 dp above).
+    pub fn tooltip_precision(mut self, p: u8) -> Self {
+        self.tooltip_precision = Some(p);
+        self
+    }
+    /// Trailing unit suffix shown in the tooltip ("ms", "px",
+    /// "%"). The string is appended as-is; pad with a space if
+    /// you want a gap.
+    pub fn tooltip_unit(mut self, u: impl Into<String>) -> Self {
+        self.tooltip_unit = Some(u.into());
+        self
+    }
 
     pub fn show(self) -> Response {
         use blinc_core::draw::{LineCap, LineJoin};
@@ -769,6 +803,9 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             background,
             disabled,
             shadow_token,
+            tooltip,
+            tooltip_precision,
+            tooltip_unit,
         } = self;
 
         let style = ui.style.clone();
@@ -780,7 +817,12 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         let height = height_override.unwrap_or(80.0);
 
         let data: Vec<f32> = value.get();
-        let (mut p, resp) = ui.allocate_painter((width, height), Sense::None);
+        let sense = if tooltip && !disabled {
+            Sense::Hover
+        } else {
+            Sense::None
+        };
+        let (mut p, resp) = ui.allocate_painter((width, height), sense);
 
         if let Some(tok) = shadow_token {
             if !disabled {
@@ -996,6 +1038,97 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             }
         }
 
+        // ─── tooltip ──────────────────────────────────────────
+        // Hover crosshair + value pill at the cursor's x. Maps the
+        // cursor's local-x back into the sample index, paints a
+        // 1 px crosshair line, dots the matched sample, then
+        // renders a small pill near the cursor with the formatted
+        // value. Skipped when disabled / no hover / data empty.
+        if tooltip && !disabled && resp.hovered {
+            if let Some(local) = resp.pointer_local {
+                let cur_x = p.rect().x() + local.x;
+                let cur_y = p.rect().y() + local.y;
+                if cur_x >= plot_x && cur_x <= plot_x + plot_w && n > 0 {
+                    let idx = if n == 1 {
+                        0
+                    } else {
+                        let t = (cur_x - plot_x) / plot_w;
+                        ((t.clamp(0.0, 1.0)) * (n - 1) as f32).round() as usize
+                    };
+                    let val = samples[idx];
+                    let sample_x = x_of(idx);
+                    let sample_y = y_of(val);
+
+                    // Crosshair — 1 px vertical at the sample's x.
+                    let crosshair_col = stroke_brush.with_alpha(0.4);
+                    p.fill_rect(
+                        Rect::new(sample_x - 0.5, plot_y, 1.0, plot_h),
+                        CornerRadius::uniform(0.0),
+                        Brush::Solid(crosshair_col),
+                    );
+                    // Sample dot.
+                    p.fill_circle(
+                        Point::new(sample_x, sample_y),
+                        line_width + 1.0,
+                        Brush::Solid(stroke_brush),
+                    );
+
+                    // Format value — auto precision picks from the
+                    // data range when the caller didn't set one.
+                    let precision = tooltip_precision.unwrap_or_else(|| {
+                        if span.abs() < 1.0 {
+                            3
+                        } else if span.abs() < 100.0 {
+                            2
+                        } else {
+                            1
+                        }
+                    });
+                    let formatted = format!("{:.1$}", val, precision as usize);
+                    let label_text = if let Some(ref u) = tooltip_unit {
+                        format!("{}{}", formatted, u)
+                    } else {
+                        formatted
+                    };
+
+                    // Pill chrome — surface bg + 1 px border + 4 px
+                    // pad each side. Width follows the text, height
+                    // 18 px (snug). Position near the cursor, offset
+                    // up + right; clamp to the plot rect.
+                    let pad_x = 6.0_f32;
+                    let pill_h = 18.0_f32;
+                    let label_w = approx_text_width(&label_text, &style);
+                    let pill_w = label_w + 2.0 * pad_x;
+                    let mut px_pill = sample_x + 8.0;
+                    let mut py_pill = cur_y - pill_h - 8.0;
+                    if px_pill + pill_w > plot_x + plot_w {
+                        px_pill = sample_x - 8.0 - pill_w;
+                    }
+                    if py_pill < plot_y {
+                        py_pill = cur_y + 8.0;
+                    }
+                    p.fill_rect(
+                        Rect::new(px_pill, py_pill, pill_w, pill_h),
+                        CornerRadius::uniform(4.0),
+                        Brush::Solid(style.field_bg),
+                    );
+                    p.stroke_rect(
+                        Rect::new(px_pill, py_pill, pill_w, pill_h),
+                        CornerRadius::uniform(4.0),
+                        &Stroke::new(1.0),
+                        Brush::Solid(style.field_border),
+                    );
+                    let mut ts = text_style(&style, style.text_primary);
+                    ts.baseline = TextBaseline::Middle;
+                    p.draw_text(
+                        &label_text,
+                        &ts,
+                        Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                    );
+                }
+            }
+        }
+
         resp
     }
 
@@ -1040,6 +1173,9 @@ impl<'a> PortalUi<'a> {
             background: None,
             disabled: false,
             shadow_token: None,
+            tooltip: true,
+            tooltip_precision: None,
+            tooltip_unit: None,
         }
     }
 }
