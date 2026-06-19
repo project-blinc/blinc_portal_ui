@@ -3398,58 +3398,45 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             }
             _ if shape.is_3d() => {
                 // ─── 3D variants ──────────────────────────────
-                // Push a clip at the widget's inner rect so the
-                // SDF's rotated 3D projection can't bleed past
-                // the border (sphere / torus rotated cylinder
-                // would otherwise have their projected silhouette
-                // extend outside the painter rect at small
-                // widget sizes).
-                let ctx = &mut *p.ctx;
-                ctx.push_clip(ClipShape::rect(inner));
-                // perspective_d pulls the virtual camera back.
-                // Box / cylinder have square / rectangular
-                // silhouettes that span the full rotated
-                // bounding box — they need more distance to fit
-                // (~2000 instead of 1400). Sphere / torus /
-                // capsule have rounder projections that already
-                // fit at 1400.
-                let persp = match shape {
-                    SdfShape::Box3D | SdfShape::Cylinder3D => 2000.0,
-                    _ => 1400.0,
-                };
-                ctx.set_3d_transform(rotate_x, rotate_y, persp);
-                ctx.set_3d_shape(
-                    shape.shape_type_3d(),
-                    depth * min_side,
-                    ambient,
-                    specular,
-                );
-                ctx.set_3d_light(light_dir, light_intensity);
-
-                // For a sphere / cylinder / torus the shader uses
-                // the rect's inscribed circle; for box / capsule
-                // it uses the rect bounds. Either way we square
-                // the inner rect so the proportions read right.
-                let sq = min_side;
+                // Inscribed square at 85 % of min_side so the
+                // rotated 3D projection has breathing room
+                // inside the widget border. Single perspective
+                // distance + uniform depth scale; the SDF reads
+                // best when the viewport is generous (use
+                // `.height(...)` to grow the widget vertically
+                // instead of fighting per-shape camera math).
+                let sq = min_side * 0.85;
                 let shape_rect = Rect::new(
                     inner.x() + (inner.width() - sq) * 0.5,
                     inner.y() + (inner.height() - sq) * 0.5,
                     sq,
                     sq,
                 );
+
+                let ctx = &mut *p.ctx;
+                ctx.set_3d_transform(rotate_x, rotate_y, 1800.0);
+                ctx.set_3d_shape(
+                    shape.shape_type_3d(),
+                    depth * sq * 0.7,
+                    ambient,
+                    specular,
+                );
+                ctx.set_3d_light(light_dir, light_intensity);
+
                 p.fill_rect(
                     shape_rect,
                     CornerRadius::uniform(0.0),
                     Brush::Solid(fill_brush),
                 );
 
-                // Reset 3D state + pop the clip we pushed above.
+                // Reset 3D state so downstream widgets paint
+                // without inheriting the shape / lighting params.
                 let ctx = &mut *p.ctx;
                 ctx.set_3d_shape(0.0, 0.0, 0.3, 32.0);
                 ctx.set_3d_transform(0.0, 0.0, 0.0);
                 ctx.set_3d_light([0.0, 0.0, 0.0], 0.0);
                 ctx.set_3d_translate_z(0.0);
-                ctx.pop_clip();
+                let _ = ClipShape::rect(inner); // silence unused import
             }
             _ => {}
         }
