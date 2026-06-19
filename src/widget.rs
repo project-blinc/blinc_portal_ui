@@ -1087,14 +1087,16 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             let bx = p.rect().x() + p.rect().width() - btn_size - pad;
             let by = p.rect().y() + pad;
             let btn_rect = blinc_core::layer::Rect::new(bx, by, btn_size, btn_size);
+            // Use SurfaceElevated (`style.background`) for the
+            // chrome bg — `field_bg` blends into the chart's
+            // surface; the elevated token is the same shade
+            // popovers / lifted controls use, so the button
+            // stands off the data.
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
                 (style.button_hover, style.field_border_focus, style.text_primary)
             } else {
-                (style.field_bg, style.field_border, style.text_secondary)
+                (style.background, style.field_border, style.text_secondary)
             };
-            // Button chrome — fills the chart bars behind so the
-            // PiP glyph reads as a separate control rather than
-            // ambiguous overlap.
             p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
             p.stroke_rect(
                 btn_rect,
@@ -1102,14 +1104,17 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
                 &Stroke::new(1.0),
                 Brush::Solid(btn_border),
             );
-            // PiP glyph centred inside the button — a 12 × 9
-            // outlined frame with a 5 × 4 fill tucked in the
-            // bottom-right corner, the canonical picture-in-
-            // picture mark.
-            let gx = bx + (btn_size - 12.0) * 0.5;
-            let gy = by + (btn_size - 12.0) * 0.5;
+            // PiP glyph: 12 × 9 outlined frame + 5 × 4 inner fill
+            // tucked into the bottom-right corner. Round the
+            // per-axis offsets so the 1.5 px stroke lands on a
+            // clean pixel grid; a half-pixel offset bleeds the
+            // stroke into anti-alias rows and reads as "off".
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
             p.stroke_rect(
-                blinc_core::layer::Rect::new(gx, gy, 12.0, 9.0),
+                blinc_core::layer::Rect::new(gx, gy, GW, GH),
                 CornerRadius::uniform(1.5),
                 &Stroke::new(1.5),
                 Brush::Solid(icon_color),
@@ -1616,7 +1621,7 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
                 (style.button_hover, style.field_border_focus, style.text_primary)
             } else {
-                (style.field_bg, style.field_border, style.text_secondary)
+                (style.background, style.field_border, style.text_secondary)
             };
             p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
             p.stroke_rect(
@@ -1625,10 +1630,17 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
                 &Stroke::new(1.0),
                 Brush::Solid(btn_border),
             );
-            let gx = bx + (btn_size - 12.0) * 0.5;
-            let gy = by + (btn_size - 12.0) * 0.5;
+            // PiP glyph: 12 × 9 BB centred per-axis. Round to
+            // half-pixels so the 1.5 px stroke lands on a clean
+            // grid; the previous mathematically-centred version
+            // looked top-biased because the inner fill sits in
+            // the BR quadrant and pulls the visual mass down.
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
             p.stroke_rect(
-                Rect::new(gx, gy, 12.0, 9.0),
+                Rect::new(gx, gy, GW, GH),
                 CornerRadius::uniform(1.5),
                 &Stroke::new(1.5),
                 Brush::Solid(icon_color),
