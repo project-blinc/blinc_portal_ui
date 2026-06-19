@@ -275,6 +275,15 @@ pub struct Portal {
     /// `available_size` control over how MUCH it paints; the portal
     /// just makes sure the slot accommodates what it asked for).
     last_consumed_height: f32,
+    /// Pixels of horizontal content the closure produced last frame
+    /// — `max(allocate_painter_rect.right()) - bounds.x() + spacing`,
+    /// clamped to 0. Host reads via [`Self::consumed_width`] and
+    /// feeds it back as a per-node width override so the slot grows
+    /// to fit the widest widget the closure produced. Same model as
+    /// `last_consumed_height` but on the horizontal axis; both
+    /// stash-on-self values are populated inside `Portal::frame`
+    /// after the closure runs.
+    last_consumed_width: f32,
     /// Scheduler tick-callback id while the portal is animating.
     /// `Some` when the closure called `ui.request_animation()` last
     /// frame; the callback is a no-op (the portal repaints itself
@@ -303,6 +312,7 @@ impl Portal {
             created_at: now,
             last_drag_pos: ahash::AHashMap::default(),
             last_consumed_height: 0.0,
+            last_consumed_width: 0.0,
             anim_tick_handle: None,
         }
     }
@@ -314,6 +324,15 @@ impl Portal {
     /// first frame runs.
     pub fn consumed_height(&self) -> f32 {
         self.last_consumed_height
+    }
+
+    /// Pixels of horizontal content the closure produced last frame.
+    /// The host should feed this back as a per-node width override
+    /// on the next frame (clamped against the template's declared
+    /// minimum) so the slot grows to fit the widest widget the
+    /// closure produced. Returns `0.0` before the first frame runs.
+    pub fn consumed_width(&self) -> f32 {
+        self.last_consumed_width
     }
 
     /// Portal id — used to derive region ids and as the public handle
@@ -415,6 +434,13 @@ impl Portal {
         // height. Using a Cell so we don't have to thread `&mut`
         // out of the read-tracking closure.
         let final_cursor_y = std::cell::Cell::new(bounds.y());
+        // Same shape for horizontal — tracks the rightmost widget
+        // edge across every `allocate_painter_internal` call. Read
+        // after the closure to derive `last_consumed_width`. Init
+        // to `bounds.x()` (not `bounds.x() + spacing`) so the
+        // consumption math at the end re-adds the leading spacing
+        // pad once, matching the height path's convention.
+        let final_max_x = std::cell::Cell::new(bounds.x());
 
         // Run the user closure inside reactive read-tracking so we
         // capture the signal set it actually touched.
@@ -440,6 +466,7 @@ impl Portal {
                 call_counter: 0,
                 kbd_keys_frame: &kbd_keys_frame,
                 kbd_chars_frame: &kbd_chars_frame,
+                final_max_x: &final_max_x,
             };
             ui_closure(&mut ui);
             final_cursor_y.set(ui.cursor.y);
@@ -469,7 +496,19 @@ impl Portal {
         let dh = consumed - prev;
         let grew = dh > 0.5;
         let shrank_idle = dh < -0.5 && !any_animating;
-        if grew || shrank_idle {
+
+        // Width path — same gate shape as height. Tracks
+        // `final_max_x` which captures every allocate's right edge.
+        // Reported as `consumed_width` for the host's per-node
+        // width override feedback loop (fit-content node sizing).
+        let consumed_w = (final_max_x.get() - bounds.x() + style.spacing).max(0.0);
+        let prev_w = self.last_consumed_width;
+        self.last_consumed_width = consumed_w;
+        let dw = consumed_w - prev_w;
+        let grew_w = dw > 0.5;
+        let shrank_w_idle = dw < -0.5 && !any_animating;
+
+        if grew || shrank_idle || grew_w || shrank_w_idle {
             self.mark_dirty();
         }
 
@@ -599,16 +638,22 @@ impl<'a> PortalFrame<'a> {
         );
         FrameOutcome {
             any_animating_or_dirty: any,
+            natural_width: self.portal.consumed_width(),
+            natural_height: self.portal.consumed_height(),
         }
     }
 }
 
 /// Typed return from [`PortalFrame::run`]. The host should call
 /// [`Self::needs_redraw`] and feed it into its repaint /
-/// animation-tick request path.
+/// animation-tick request path. `natural_width` / `natural_height`
+/// report what the closure actually used, for hosts driving
+/// fit-content node sizing.
 #[must_use = "FrameOutcome reports whether the portal needs another paint; consult `.needs_redraw()`"]
 pub struct FrameOutcome {
     any_animating_or_dirty: bool,
+    natural_width: f32,
+    natural_height: f32,
 }
 
 impl FrameOutcome {
@@ -616,6 +661,21 @@ impl FrameOutcome {
     /// this frame — the host should request another paint when true.
     pub fn needs_redraw(&self) -> bool {
         self.any_animating_or_dirty
+    }
+
+    /// Pixels of horizontal content the closure produced. Same value
+    /// as `Portal::consumed_width()`; surfaced here for hosts that
+    /// only see the `FrameOutcome` (typed-builder consumers). Use
+    /// for fit-content width feedback.
+    pub fn natural_width(&self) -> f32 {
+        self.natural_width
+    }
+
+    /// Pixels of vertical content the closure produced. Same value
+    /// as `Portal::consumed_height()`; surfaced here for hosts that
+    /// only see the `FrameOutcome`.
+    pub fn natural_height(&self) -> f32 {
+        self.natural_height
     }
 }
 
@@ -696,6 +756,16 @@ pub struct PortalUi<'a> {
     /// snapshot. Both empty if no keyboard hook was installed.
     pub(crate) kbd_keys_frame: &'a [KbdKey],
     pub(crate) kbd_chars_frame: &'a [char],
+    /// Running max of `allocate_painter` rect right-edges seen this
+    /// frame. Initialised to `bounds.x()` at frame start. Read after
+    /// the closure runs to compute the natural width the closure
+    /// produced — the host uses this to grow the slot on the next
+    /// frame so widgets that overflow the current bounds get the
+    /// horizontal room they need. Borrowed Cell so updates can flow
+    /// through `&mut self` widget methods without threading `&mut`
+    /// out of the read-tracking closure (same shape as
+    /// `final_cursor_y` in `Portal::frame`).
+    pub(crate) final_max_x: &'a std::cell::Cell<f32>,
 }
 
 impl<'a> PortalUi<'a> {
@@ -916,6 +986,14 @@ impl<'a> PortalUi<'a> {
         widget_id: WidgetId,
     ) -> (PortalPainter<'_>, Response) {
         let rect = Rect::new(self.cursor.x, self.cursor.y, size.0, size.1);
+        // Track the widest allocated rect this frame for the
+        // fit-content feedback loop. Fires before the cursor
+        // advances so horizontal-layout's running carriage doesn't
+        // skew the measurement — `rect.right()` is the same value
+        // whether the cursor will advance on x or y next.
+        let right_edge = rect.x() + rect.width();
+        self.final_max_x
+            .set(self.final_max_x.get().max(right_edge));
         // Advance the cursor for the next widget.
         match self.layout {
             LayoutDirection::Vertical => self.cursor.y += size.1 + self.style.spacing,
