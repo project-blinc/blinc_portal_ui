@@ -3269,7 +3269,7 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
     }
 
     pub fn show(self) -> Response {
-        use blinc_core::layer::{CornerRadius, Rect};
+        use blinc_core::layer::{ClipShape, CornerRadius, Rect};
 
         let SdfShapeBuilder {
             ui,
@@ -3398,14 +3398,22 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             }
             _ if shape.is_3d() => {
                 // ─── 3D variants ──────────────────────────────
-                // Set DrawContext 3D state, emit a primitive, then
-                // reset state so downstream widgets don't inherit
-                // the shape / lighting params. The GPU fragment
-                // shader raymarches the chosen SDF; the primitive
-                // we emit is a fill_rect whose bounds size the
-                // marching volume.
+                // Push a clip at the widget's inner rect so the
+                // SDF's rotated 3D projection can't bleed past
+                // the border (sphere / torus rotated cylinder
+                // would otherwise have their projected silhouette
+                // extend outside the painter rect at small
+                // widget sizes).
                 let ctx = &mut *p.ctx;
-                ctx.set_3d_transform(rotate_x, rotate_y, 800.0);
+                ctx.push_clip(ClipShape::rect(inner));
+                // perspective_d = 1400 pulls the virtual camera
+                // back a fair bit. The default 800 from the CSS
+                // pipeline reads as "in your face" inside a 96 px
+                // preview — the projected shape silhouette
+                // exceeds the rect. A larger value flattens the
+                // perspective so the rotated shape stays within
+                // bounds.
+                ctx.set_3d_transform(rotate_x, rotate_y, 1400.0);
                 ctx.set_3d_shape(
                     shape.shape_type_3d(),
                     depth * min_side,
@@ -3431,14 +3439,13 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
                     Brush::Solid(fill_brush),
                 );
 
-                // Reset 3D state — shape_type 0 disables SDF in
-                // the shader, transform back to identity, light
-                // intensity to 0.
+                // Reset 3D state + pop the clip we pushed above.
                 let ctx = &mut *p.ctx;
                 ctx.set_3d_shape(0.0, 0.0, 0.3, 32.0);
                 ctx.set_3d_transform(0.0, 0.0, 0.0);
                 ctx.set_3d_light([0.0, 0.0, 0.0], 0.0);
                 ctx.set_3d_translate_z(0.0);
+                ctx.pop_clip();
             }
             _ => {}
         }
