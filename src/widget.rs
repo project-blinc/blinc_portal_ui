@@ -3408,14 +3408,20 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             }
             _ if shape.is_3d() => {
                 // ─── 3D variants ──────────────────────────────
-                // Inscribed square at 70 % of min_side so the
-                // worst-case rotated silhouette (45° y-rotated
-                // box ≈ √2× footprint) still lands inside the
-                // widget border. A scissor clip on `inner` is
-                // pushed for defence in depth so any residual
-                // overshoot is hard-bounded by the widget rect
-                // (e.g. shapes with steeper rotation overrides).
-                let sq = min_side * 0.70;
+                // Inscribed 80 % square + scissor clip on the
+                // inner rect. The clip is the hard guarantee
+                // against overshoot (worst-case 45° y-rotation
+                // grows the box silhouette by ~√2 ×); the 0.80
+                // inset gives breathing room before the clip
+                // ever kicks in, so the typical case reads as
+                // a clean inscribed shape, not a clipped slice.
+                //
+                // Depth equals `depth_input × sq` (depth scale
+                // 1.0) so the shape carries full z-extent — at
+                // lower depth scales (e.g. 0.7) the box / torus
+                // shading flattens and the silhouette reads
+                // smudged at oblique angles.
+                let sq = min_side * 0.80;
                 let shape_rect = Rect::new(
                     inner.x() + (inner.width() - sq) * 0.5,
                     inner.y() + (inner.height() - sq) * 0.5,
@@ -3429,7 +3435,7 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
                 ctx.set_3d_transform(rotate_x, rotate_y, 1800.0);
                 ctx.set_3d_shape(
                     shape.shape_type_3d(),
-                    depth * sq * 0.7,
+                    depth * sq,
                     ambient,
                     specular,
                 );
