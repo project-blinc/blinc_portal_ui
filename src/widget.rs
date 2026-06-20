@@ -825,11 +825,13 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
 
         let style = ui.style.clone();
         let (avail_w, _) = ui.available_size();
-        // Defaults — 240 × 80 is the inline-sparkline sweet spot.
         // Width follows the parent allocation when unset, clamped
-        // to a sensible band; height pins to 80 px (20 grid units).
+        // to a sensible band. Height defaults to width so charts
+        // read as a perfect square — display portals (charts,
+        // noise, texture, SDF) all share the 1 : 1 convention.
+        // Callers can still force a non-square via `.height(N)`.
         let width = width_override.unwrap_or_else(|| avail_w.clamp(120.0, 240.0));
-        let height = height_override.unwrap_or(80.0);
+        let height = height_override.unwrap_or(width);
 
         let data: Vec<f32> = value.get();
         // PiP icon needs click detection; tooltip needs hover.
@@ -3301,8 +3303,11 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
 
         let style = ui.style.clone();
         let (avail_w, _) = ui.available_size();
-        let width = width_override.unwrap_or_else(|| avail_w.clamp(96.0, 160.0));
-        let height = height_override.unwrap_or(96.0);
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(96.0, 240.0));
+        // Default to a square — every display portal (charts,
+        // noise, texture, SDF) reads best at 1 : 1. Callers can
+        // still force a non-square via `.height(N)`.
+        let height = height_override.unwrap_or(width);
 
         let sense = if pip && !disabled {
             Sense::Click
@@ -3403,20 +3408,22 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             }
             _ if shape.is_3d() => {
                 // ─── 3D variants ──────────────────────────────
-                // Inscribed square at 85 % of min_side so the
-                // rotated 3D projection has breathing room
-                // inside the widget border. Single perspective
-                // distance + uniform depth scale; the SDF reads
-                // best when the viewport is generous (use
-                // `.height(...)` to grow the widget vertically
-                // instead of fighting per-shape camera math).
-                let sq = min_side * 0.85;
+                // Inscribed square at 70 % of min_side so the
+                // worst-case rotated silhouette (45° y-rotated
+                // box ≈ √2× footprint) still lands inside the
+                // widget border. A scissor clip on `inner` is
+                // pushed for defence in depth so any residual
+                // overshoot is hard-bounded by the widget rect
+                // (e.g. shapes with steeper rotation overrides).
+                let sq = min_side * 0.70;
                 let shape_rect = Rect::new(
                     inner.x() + (inner.width() - sq) * 0.5,
                     inner.y() + (inner.height() - sq) * 0.5,
                     sq,
                     sq,
                 );
+
+                p.ctx.push_clip(ClipShape::rect(inner));
 
                 let ctx = &mut *p.ctx;
                 ctx.set_3d_transform(rotate_x, rotate_y, 1800.0);
@@ -3441,7 +3448,8 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
                 ctx.set_3d_transform(0.0, 0.0, 0.0);
                 ctx.set_3d_light([0.0, 0.0, 0.0], 0.0);
                 ctx.set_3d_translate_z(0.0);
-                let _ = ClipShape::rect(inner); // silence unused import
+
+                p.ctx.pop_clip();
             }
             _ => {}
         }
