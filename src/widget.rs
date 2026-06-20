@@ -22,9 +22,10 @@ use crate::core::{
     ctrl_radius, ButtonVariant, PortalStyle, PortalValue, Response, Sense, ShadowMix, ShadowToken,
     ValueBinding,
 };
+use crate::painter::PortalPainter;
 use crate::ui::PortalUi;
 use blinc_core::draw::{Stroke, TextStyle};
-use blinc_core::layer::{Brush, Color, Point};
+use blinc_core::layer::{Brush, Color, CornerRadius, Point, Rect};
 use blinc_core::reactive::Signal;
 use blinc_core::{FontWeight, TextAlign, TextBaseline};
 
@@ -651,6 +652,401 @@ pub enum ChartDecimation {
     /// vertex count vs `Stride` but preserves the envelope of
     /// noisy signals.
     MinMax,
+}
+
+/// Pure chart series-paint params for host callers. Drives
+/// [`paint_chart`] — the line / bar / area series + baseline +
+/// latest-marker render, decoupled from the interactive
+/// [`ChartsBuilder`] (no background / shadow / tooltip / PiP
+/// button). Lets a host paint the same chart from a plain
+/// `blinc_layout::canvas` closure via [`PortalPainter::for_host`],
+/// e.g. a PiP popover showing the expanded series.
+///
+/// The render core is intentionally a sibling of `ChartsBuilder::show`
+/// rather than a shared extraction: `show` threads the same `lo`/`hi`/
+/// `samples` locals into its hover-tooltip pass, so factoring them out
+/// would entangle the interactive path for no host-visible gain. Keep
+/// the two in sync when the series math changes.
+#[derive(Clone)]
+pub struct ChartPaint {
+    pub variant: ChartVariant,
+    pub y_range: Option<std::ops::Range<f32>>,
+    pub line_width: f32,
+    pub bar_gap: f32,
+    pub show_baseline: bool,
+    pub show_latest: bool,
+    pub fill_area: bool,
+    pub decimation: ChartDecimation,
+    pub stroke_color: Option<Color>,
+    pub fill_color: Option<Color>,
+    pub baseline_color: Option<Color>,
+    /// Opacity multiplier on the resolved series colours (1.0 =
+    /// opaque; lower to render a disabled / ghosted chart).
+    pub alpha: f32,
+}
+
+impl Default for ChartPaint {
+    fn default() -> Self {
+        Self {
+            variant: ChartVariant::Line,
+            y_range: None,
+            line_width: 1.5,
+            bar_gap: 2.0,
+            show_baseline: false,
+            show_latest: false,
+            fill_area: false,
+            decimation: ChartDecimation::Stride,
+            stroke_color: None,
+            fill_color: None,
+            baseline_color: None,
+            alpha: 1.0,
+        }
+    }
+}
+
+/// Paint a chart series into `plot` (the data rect, already inset)
+/// using a host-built [`PortalPainter`]. See [`ChartPaint`].
+pub fn paint_chart(
+    p: &mut PortalPainter,
+    plot: Rect,
+    data: &[f32],
+    opts: &ChartPaint,
+    style: &PortalStyle,
+) {
+    use blinc_core::draw::{LineCap, LineJoin};
+    let plot_x = plot.x();
+    let plot_y = plot.y();
+    let plot_w = plot.width().max(0.0);
+    let plot_h = plot.height().max(0.0);
+    if plot_w < 2.0 || plot_h < 2.0 || data.is_empty() {
+        return;
+    }
+
+    // NaN-safe lo/hi, with the same range/degenerate handling as
+    // ChartsBuilder::show.
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &v in data {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() {
+        (0.0, 1.0)
+    } else if let Some(r) = opts.y_range.clone() {
+        (r.start, r.end)
+    } else if (hi - lo).abs() < 1e-6 {
+        (lo - 0.5, hi + 0.5)
+    } else {
+        (lo, hi)
+    };
+    let span = (hi - lo).max(1e-6);
+    let y_of = |v: f32| -> f32 {
+        let t = ((v - lo) / span).clamp(0.0, 1.0);
+        plot_y + plot_h * (1.0 - t)
+    };
+
+    let col_budget: usize = match opts.variant {
+        ChartVariant::Bar => ((plot_w / (1.0 + opts.bar_gap)).floor() as usize).max(1),
+        _ => (plot_w.floor() as usize).max(2),
+    };
+    let samples: Vec<f32> = if data.len() <= col_budget {
+        data.iter()
+            .map(|v| if v.is_finite() { *v } else { lo })
+            .collect()
+    } else {
+        match opts.decimation {
+            ChartDecimation::Stride => {
+                let n = col_budget;
+                (0..n)
+                    .map(|i| {
+                        let idx = (i * data.len()) / n;
+                        let v = data[idx.min(data.len() - 1)];
+                        if v.is_finite() {
+                            v
+                        } else {
+                            lo
+                        }
+                    })
+                    .collect()
+            }
+            ChartDecimation::MinMax => {
+                let buckets = (col_budget / 2).max(1);
+                let mut out: Vec<f32> = Vec::with_capacity(buckets * 2);
+                for b in 0..buckets {
+                    let s = (b * data.len()) / buckets;
+                    let e = ((b + 1) * data.len()) / buckets;
+                    let end = e.max(s + 1).min(data.len());
+                    let slice = &data[s..end];
+                    let mut mn = f32::INFINITY;
+                    let mut mx = f32::NEG_INFINITY;
+                    for &v in slice {
+                        if v.is_finite() {
+                            mn = mn.min(v);
+                            mx = mx.max(v);
+                        }
+                    }
+                    if !mn.is_finite() {
+                        mn = lo;
+                        mx = lo;
+                    }
+                    out.push(mn);
+                    out.push(mx);
+                }
+                out
+            }
+        }
+    };
+
+    let a = opts.alpha.clamp(0.0, 1.0);
+    let stroke_brush = opts.stroke_color.unwrap_or(style.accent).with_alpha(a);
+    // Default fill is a translucent accent (0.15); an explicit
+    // fill_color keeps its own alpha. The disabled multiplier `a`
+    // scales whichever base applies.
+    let fill_base = opts
+        .fill_color
+        .unwrap_or_else(|| style.accent.with_alpha(0.15));
+    let fill_brush = if a < 1.0 {
+        fill_base.with_alpha(a * 0.15)
+    } else {
+        fill_base
+    };
+    let baseline_col = opts
+        .baseline_color
+        .unwrap_or(style.text_secondary.with_alpha(0.3))
+        .with_alpha(a);
+
+    if opts.show_baseline {
+        let by = if lo <= 0.0 && hi >= 0.0 {
+            y_of(0.0)
+        } else {
+            plot_y + plot_h
+        };
+        p.fill_rect(
+            Rect::new(plot_x, by - 0.5, plot_w, 1.0),
+            CornerRadius::uniform(0.0),
+            Brush::Solid(baseline_col),
+        );
+    }
+
+    let n = samples.len();
+    let x_of = |i: usize| -> f32 {
+        if n <= 1 {
+            plot_x
+        } else {
+            plot_x + (i as f32) * (plot_w / ((n - 1) as f32))
+        }
+    };
+
+    match opts.variant {
+        ChartVariant::Bar => {
+            let baseline_y = if lo <= 0.0 && hi >= 0.0 {
+                y_of(0.0)
+            } else {
+                plot_y + plot_h
+            };
+            let col_w = plot_w / n.max(1) as f32;
+            let bar_w = (col_w - opts.bar_gap).max(1.0);
+            for (i, &v) in samples.iter().enumerate() {
+                let cx = plot_x + (i as f32 + 0.5) * col_w;
+                let bar_x = cx - bar_w * 0.5;
+                let yv = y_of(v);
+                let (top, h) = if yv <= baseline_y {
+                    (yv, baseline_y - yv)
+                } else {
+                    (baseline_y, yv - baseline_y)
+                };
+                if h >= 0.5 {
+                    p.fill_rect(
+                        Rect::new(bar_x, top, bar_w, h),
+                        CornerRadius::uniform((bar_w * 0.25).min(2.0)),
+                        Brush::Solid(stroke_brush),
+                    );
+                }
+            }
+        }
+        ChartVariant::Line | ChartVariant::Area => {
+            if n == 1 {
+                p.fill_circle(
+                    Point::new(x_of(0), y_of(samples[0])),
+                    opts.line_width.max(1.5),
+                    Brush::Solid(stroke_brush),
+                );
+            } else {
+                let mut path = blinc_core::draw::Path::new();
+                path = path.move_to(x_of(0), y_of(samples[0]));
+                for i in 1..n {
+                    path = path.line_to(x_of(i), y_of(samples[i]));
+                }
+                let area_on = opts.fill_area || matches!(opts.variant, ChartVariant::Area);
+                if area_on {
+                    let base_y = if lo <= 0.0 && hi >= 0.0 {
+                        y_of(0.0)
+                    } else {
+                        plot_y + plot_h
+                    };
+                    let mut area = blinc_core::draw::Path::new();
+                    area = area.move_to(x_of(0), base_y);
+                    for i in 0..n {
+                        area = area.line_to(x_of(i), y_of(samples[i]));
+                    }
+                    area = area.line_to(x_of(n - 1), base_y).close();
+                    p.fill_path(&area, Brush::Solid(fill_brush));
+                }
+                let stroke = Stroke::new(opts.line_width)
+                    .with_cap(LineCap::Round)
+                    .with_join(LineJoin::Round);
+                p.stroke_path(&path, &stroke, Brush::Solid(stroke_brush));
+            }
+            if opts.show_latest {
+                let li = n - 1;
+                p.fill_circle(
+                    Point::new(x_of(li), y_of(samples[li])),
+                    opts.line_width + 1.0,
+                    Brush::Solid(stroke_brush),
+                );
+            }
+        }
+    }
+}
+
+/// Pure pie/donut paint params for host callers. Drives
+/// [`paint_pie`] — the slice wedges + optional donut hole + slice-
+/// gap seams, decoupled from the interactive [`PieChartBuilder`]
+/// (no background / shadow / tooltip / PiP button). Sibling of
+/// `PieChartBuilder::show`'s render core; keep in sync when the
+/// slice math changes.
+#[derive(Clone)]
+pub struct PiePaint {
+    /// Donut hole as a fraction of the outer radius (0 = solid pie).
+    pub inner_ratio: f32,
+    /// Per-slice colours; `None` = golden-angle accent rotation.
+    pub palette: Option<Vec<Color>>,
+    /// Width of the seam stroke painted between slices (0 = none).
+    pub slice_gap: f32,
+    /// Colour for the slice-gap seams — only drawn when `Some`
+    /// (a transparent gap would punch through to whatever's below).
+    pub gap_bg: Option<Color>,
+    /// Opacity multiplier on slice colours (1.0 = opaque).
+    pub alpha: f32,
+}
+
+impl Default for PiePaint {
+    fn default() -> Self {
+        Self {
+            inner_ratio: 0.0,
+            palette: None,
+            slice_gap: 0.0,
+            gap_bg: None,
+            alpha: 1.0,
+        }
+    }
+}
+
+/// Paint a pie / donut centred at `center` with radius `outer_r`
+/// using a host-built [`PortalPainter`]. See [`PiePaint`].
+pub fn paint_pie(
+    p: &mut PortalPainter,
+    center: Point,
+    outer_r: f32,
+    weights: &[f32],
+    opts: &PiePaint,
+    style: &PortalStyle,
+) {
+    if outer_r < 4.0 {
+        return;
+    }
+    let mut total = 0.0_f32;
+    for &w in weights {
+        if w.is_finite() && w > 0.0 {
+            total += w;
+        }
+    }
+    if total <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (center.x, center.y);
+    let inner_r = outer_r * opts.inner_ratio.clamp(0.0, 0.95);
+    let a = opts.alpha.clamp(0.0, 1.0);
+    let (h0, _s, _v, _al) = style.accent.to_hsva();
+    let default_color = |i: usize| -> Color {
+        const GOLDEN: f32 = 137.508;
+        let h = (h0 + GOLDEN * i as f32).rem_euclid(360.0);
+        Color::from_hsva(h, 0.55, 0.92, a)
+    };
+
+    let two_pi = std::f32::consts::TAU;
+    let start_offset = -std::f32::consts::FRAC_PI_2;
+    struct Slice {
+        a0: f32,
+        a1: f32,
+        color: Color,
+    }
+    let mut spans: Vec<Slice> = Vec::with_capacity(weights.len());
+    let mut acc = 0.0_f32;
+    let mut slice_idx = 0;
+    for (i, &w) in weights.iter().enumerate() {
+        if !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        let a0 = start_offset + acc / total * two_pi;
+        acc += w;
+        let a1 = start_offset + acc / total * two_pi;
+        let color = opts
+            .palette
+            .as_ref()
+            .and_then(|pal| pal.get(i % pal.len()).copied())
+            .map(|c| c.with_alpha(a))
+            .unwrap_or_else(|| default_color(slice_idx));
+        slice_idx += 1;
+        spans.push(Slice { a0, a1, color });
+    }
+
+    for slice in &spans {
+        let (a0, a1, color) = (slice.a0, slice.a1, slice.color);
+        let span = a1 - a0;
+        let steps = ((span.abs().to_degrees() as i32).max(8) as usize).max(8);
+        let step_da = span / steps as f32;
+        let mut path = blinc_core::draw::Path::new();
+        if inner_r > 0.0 {
+            let astart = a0;
+            let inner_start = Point::new(cx + inner_r * astart.cos(), cy + inner_r * astart.sin());
+            path = path.move_to(inner_start.x, inner_start.y);
+            for k in 0..=steps {
+                let ak = a0 + step_da * k as f32;
+                path = path.line_to(cx + outer_r * ak.cos(), cy + outer_r * ak.sin());
+            }
+            for k in 0..=steps {
+                let ak = a1 - step_da * k as f32;
+                path = path.line_to(cx + inner_r * ak.cos(), cy + inner_r * ak.sin());
+            }
+            path = path.close();
+        } else {
+            path = path.move_to(cx, cy);
+            for k in 0..=steps {
+                let ak = a0 + step_da * k as f32;
+                path = path.line_to(cx + outer_r * ak.cos(), cy + outer_r * ak.sin());
+            }
+            path = path.close();
+        }
+        p.fill_path(&path, Brush::Solid(color));
+    }
+
+    if opts.slice_gap > 0.0 {
+        if let Some(bg) = opts.gap_bg {
+            for slice in &spans {
+                let a0 = slice.a0;
+                let (sa, ca) = (a0.sin(), a0.cos());
+                let inner_pt = Point::new(cx + inner_r.max(0.0) * ca, cy + inner_r.max(0.0) * sa);
+                let outer_pt = Point::new(cx + outer_r * ca, cy + outer_r * sa);
+                let gap_path = blinc_core::draw::Path::new()
+                    .move_to(inner_pt.x, inner_pt.y)
+                    .line_to(outer_pt.x, outer_pt.y);
+                p.stroke_path(&gap_path, &Stroke::new(opts.slice_gap), Brush::Solid(bg));
+            }
+        }
+    }
 }
 
 #[must_use = "ChartsBuilder is lazy — call .show() / .changed() to paint"]

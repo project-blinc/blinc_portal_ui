@@ -32,6 +32,22 @@ pub struct PortalPainter<'a> {
 }
 
 impl<'a> PortalPainter<'a> {
+    /// Build a painter directly over a host `DrawContext` + rect,
+    /// WITHOUT a `Portal::frame` context. For hosts that want to
+    /// reuse portal-ui's pure paint helpers (e.g.
+    /// [`crate::paint_chart`] / [`crate::paint_pie`]) from a plain
+    /// `blinc_layout::canvas` closure — a PiP popover rendering the
+    /// expanded chart, a thumbnail preview, etc. `time` seeds the
+    /// painter clock for any time-based decoration; pass `0.0` when
+    /// there's no animation.
+    pub fn for_host(ctx: &'a mut dyn DrawContext, rect: Rect, time: f32) -> Self {
+        Self {
+            ctx,
+            rect,
+            time_s: time,
+        }
+    }
+
     /// Outer rect in canvas-content coordinates.
     pub fn rect(&self) -> Rect {
         self.rect

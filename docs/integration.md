@@ -155,24 +155,49 @@ Display portals (`chart`, `pie_chart`, `radar_chart`, `noise`,
 24 px top strip and paints a small corner button. The host opens
 an expanded view by anchoring an overlay against the response rect:
 
+The chart widgets need a `Portal::frame` context that a host
+overlay Div doesn't have, so the expanded view uses the **pure
+paint helpers** — `paint_chart` / `paint_pie` over a
+`PortalPainter::for_host(ctx, rect, time)` built from a
+`blinc_layout::canvas` closure's `DrawContext`:
+
 ```rust
 let resp = ui.chart(&samples).area().pip(true).show();
 if resp.pip_clicked {
     let anchor = ui.host().rect_to_screen(resp.rect);
+    let series = samples.clone(); // shared signal cell
     blinc_cn::popover()
         .at(anchor.x(), anchor.y())
         .size(480.0, 320.0)
         .content(move || {
-            // Paint the same signal-bound chart at the larger size.
+            let series = series.clone();
+            blinc_layout::canvas(move |ctx, bounds| {
+                let data = series.get();
+                let style = PortalStyle::from_active_theme();
+                let mut p = PortalPainter::for_host(
+                    ctx, Rect::new(0.0, 0.0, bounds.width, bounds.height), 0.0);
+                paint_chart(
+                    &mut p,
+                    Rect::new(0.0, 0.0, bounds.width, bounds.height),
+                    &data,
+                    &ChartPaint { variant: ChartVariant::Area,
+                                  show_baseline: true, show_latest: true,
+                                  ..Default::default() },
+                    &style,
+                );
+            }).w(448.0).h(260.0)
         })
         .show()
         .unwrap();
 }
 ```
 
-The expanded chart can share the signal cell with the inline
-widget, so edits from inside the popover (drag a series, etc.)
-immediately reflect in the inline widget on the next frame.
+Because the popover reads the same signal cell, edits from inside
+it (or live data updates) reflect in the inline widget on the next
+frame. `paint_pie` is the donut/pie analogue:
+`paint_pie(&mut p, center, outer_r, &weights, &PiePaint { inner_ratio: 0.55, ..Default::default() }, &style)`.
+Both helpers paint only the series (no background / tooltip / PiP
+button) — the host owns the popover chrome.
 
 ## Theme integration
 
