@@ -46,9 +46,9 @@ pub use crate::ui::{
     install_click_hook, FrameOutcome, LayoutDirection, Portal, PortalFrame, PortalManager, PortalUi,
 };
 pub use crate::widget::{
-    paint_chart, paint_pie, ButtonBuilder, ChartDecimation, ChartPaint, ChartVariant,
+    paint_chart, paint_pie, paint_radar, ButtonBuilder, ChartDecimation, ChartPaint, ChartVariant,
     ChartsBuilder, ColorPickerBuilder, NoiseBuilder, NoiseVariant, NumericInputBuilder,
-    PieChartBuilder, PiePaint, RadarChartBuilder, SdfShape, SdfShapeBuilder, SelectBuilder,
-    SliderBuilder, SwitchBuilder, TextInputBuilder, TextureBuilder, TextureFit, TextureSource,
-    WaveGraphBuilder, WaveStyle,
+    PieChartBuilder, PiePaint, RadarChartBuilder, RadarPaint, SdfShape, SdfShapeBuilder,
+    SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder, TextureBuilder, TextureFit,
+    TextureSource, WaveGraphBuilder, WaveStyle,
 };

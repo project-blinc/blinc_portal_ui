@@ -1210,6 +1210,257 @@ pub fn paint_pie(
     }
 }
 
+/// Pure radar / spider-chart paint params for host callers. Drives
+/// [`paint_radar`] — concentric grid rings + axis spokes + the
+/// value polygon + optional vertex markers + axis labels + an
+/// opt-in hover tooltip (`tooltip_cursor`). Sibling of
+/// `RadarChartBuilder::show`'s render core; keep in sync when the
+/// radial math changes.
+#[derive(Clone)]
+pub struct RadarPaint {
+    /// Per-axis labels (drawn outside the outer ring). `None` = no
+    /// labels; the caller should then pass a larger `outer_r`.
+    pub labels: Option<Vec<String>>,
+    /// Radial range `(min, max)`; `None` autoscales `0..max`.
+    pub y_range: Option<std::ops::Range<f32>>,
+    pub line_width: f32,
+    pub show_grid: bool,
+    pub show_axes: bool,
+    pub fill_area: bool,
+    pub show_vertices: bool,
+    pub stroke_color: Option<Color>,
+    pub fill_color: Option<Color>,
+    pub grid_color: Option<Color>,
+    pub axis_color: Option<Color>,
+    pub alpha: f32,
+    /// Cursor in painter space; when over the chart, a pill shows
+    /// the nearest axis's label + value. `None` = no tooltip.
+    pub tooltip_cursor: Option<Point>,
+    pub tooltip_unit: Option<String>,
+}
+
+impl Default for RadarPaint {
+    fn default() -> Self {
+        Self {
+            labels: None,
+            y_range: None,
+            line_width: 1.5,
+            show_grid: true,
+            show_axes: true,
+            fill_area: true,
+            show_vertices: false,
+            stroke_color: None,
+            fill_color: None,
+            grid_color: None,
+            axis_color: None,
+            alpha: 1.0,
+            tooltip_cursor: None,
+            tooltip_unit: None,
+        }
+    }
+}
+
+/// Paint a radar / spider chart centred at `center` with radius
+/// `outer_r` using a host-built [`PortalPainter`]. Needs ≥ 3 data
+/// axes. See [`RadarPaint`].
+pub fn paint_radar(
+    p: &mut PortalPainter,
+    center: Point,
+    outer_r: f32,
+    data: &[f32],
+    opts: &RadarPaint,
+    style: &PortalStyle,
+) {
+    use blinc_core::draw::{LineCap, LineJoin};
+    let n = data.len();
+    if n < 3 || outer_r < 8.0 {
+        return;
+    }
+    let (cx, cy) = (center.x, center.y);
+
+    let mut hi = f32::NEG_INFINITY;
+    for &v in data {
+        if v.is_finite() {
+            hi = hi.max(v);
+        }
+    }
+    let (lo, hi) = if !hi.is_finite() {
+        (0.0, 1.0)
+    } else if let Some(r) = opts.y_range.clone() {
+        (r.start, r.end)
+    } else if hi.abs() < 1e-6 {
+        (0.0, 1.0)
+    } else {
+        (0.0, hi)
+    };
+    let span = (hi - lo).max(1e-6);
+
+    let a = opts.alpha.clamp(0.0, 1.0);
+    let stroke = opts.stroke_color.unwrap_or(style.accent).with_alpha(a);
+    let fill = opts
+        .fill_color
+        .map(|fc| fc.with_alpha(a))
+        .unwrap_or_else(|| style.accent.with_alpha(a * 0.18));
+    let grid_col = opts
+        .grid_color
+        .unwrap_or_else(|| style.field_border.with_alpha(a * 0.7));
+    let axis_col = opts
+        .axis_color
+        .unwrap_or_else(|| style.text_secondary.with_alpha(a * 0.35));
+
+    let two_pi = std::f32::consts::TAU;
+    let start_offset = -std::f32::consts::FRAC_PI_2;
+    let axis_angle = |i: usize| -> f32 { start_offset + (i as f32) * two_pi / (n as f32) };
+
+    if opts.show_grid {
+        for k in 1..=4 {
+            let r = outer_r * (k as f32) * 0.25;
+            p.stroke_circle(
+                Point::new(cx, cy),
+                r,
+                &Stroke::new(1.0),
+                Brush::Solid(grid_col),
+            );
+        }
+    }
+    if opts.show_axes {
+        for i in 0..n {
+            let ang = axis_angle(i);
+            let spoke = blinc_core::draw::Path::new()
+                .move_to(cx, cy)
+                .line_to(cx + outer_r * ang.cos(), cy + outer_r * ang.sin());
+            p.stroke_path(&spoke, &Stroke::new(1.0), Brush::Solid(axis_col));
+        }
+    }
+
+    let mut vertices: Vec<Point> = Vec::with_capacity(n);
+    for (i, &v) in data.iter().enumerate() {
+        let t = if v.is_finite() {
+            ((v - lo) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let r = outer_r * t;
+        let ang = axis_angle(i);
+        vertices.push(Point::new(cx + r * ang.cos(), cy + r * ang.sin()));
+    }
+
+    if opts.fill_area {
+        let mut area = blinc_core::draw::Path::new();
+        area = area.move_to(vertices[0].x, vertices[0].y);
+        for v in vertices.iter().skip(1) {
+            area = area.line_to(v.x, v.y);
+        }
+        area = area.close();
+        p.fill_path(&area, Brush::Solid(fill));
+    }
+
+    let mut poly = blinc_core::draw::Path::new();
+    poly = poly.move_to(vertices[0].x, vertices[0].y);
+    for v in vertices.iter().skip(1) {
+        poly = poly.line_to(v.x, v.y);
+    }
+    poly = poly.line_to(vertices[0].x, vertices[0].y);
+    let stroke_def = Stroke::new(opts.line_width)
+        .with_cap(LineCap::Round)
+        .with_join(LineJoin::Round);
+    p.stroke_path(&poly, &stroke_def, Brush::Solid(stroke));
+
+    if opts.show_vertices {
+        for v in &vertices {
+            p.fill_circle(*v, opts.line_width + 1.0, Brush::Solid(stroke));
+        }
+    }
+
+    if let Some(ref labels) = opts.labels {
+        let mut ts = text_style(style, style.text_secondary.with_alpha(a));
+        ts.baseline = TextBaseline::Middle;
+        for (i, label) in labels.iter().enumerate().take(n) {
+            if label.is_empty() {
+                continue;
+            }
+            let ang = axis_angle(i);
+            let lr = outer_r + 8.0;
+            let lx = cx + lr * ang.cos();
+            let ly = cy + lr * ang.sin();
+            let lw = approx_text_width(label, style);
+            let lx = if ang.cos() < -0.2 {
+                lx - lw
+            } else if ang.cos() < 0.2 {
+                lx - lw * 0.5
+            } else {
+                lx
+            };
+            p.draw_text(label, &ts, Point::new(lx, ly));
+        }
+    }
+
+    // ── Hover tooltip ────────────────────────────────────────
+    if let Some(cursor) = opts.tooltip_cursor {
+        let dx = cursor.x - cx;
+        let dy = cursor.y - cy;
+        let r = (dx * dx + dy * dy).sqrt();
+        if r >= 1.0 && r <= outer_r + 8.0 {
+            let cursor_ang = dy.atan2(dx);
+            let mut best_i = 0usize;
+            let mut best_d = f32::INFINITY;
+            for i in 0..n {
+                let ang = axis_angle(i);
+                let diff = ((cursor_ang - ang).sin().abs()).atan2((cursor_ang - ang).cos());
+                let dd = diff.abs();
+                if dd < best_d {
+                    best_d = dd;
+                    best_i = i;
+                }
+            }
+            let val = data[best_i];
+            let label_pref = opts
+                .labels
+                .as_ref()
+                .and_then(|ls| ls.get(best_i).cloned())
+                .filter(|s| !s.is_empty());
+            let formatted = format!("{:.2}", val);
+            let body = match &opts.tooltip_unit {
+                Some(u) => format!("{}{}", formatted, u),
+                None => formatted,
+            };
+            let label_text = match label_pref {
+                Some(name) => format!("{}: {}", name, body),
+                None => body,
+            };
+            let pad_x = 6.0_f32;
+            let pill_h = 18.0_f32;
+            let pill_w = approx_text_width(&label_text, style) + 2.0 * pad_x;
+            let mut px_pill = cursor.x + 12.0;
+            let mut py_pill = cursor.y - pill_h - 8.0;
+            if px_pill + pill_w > p.rect().x() + p.rect().width() {
+                px_pill = cursor.x - 12.0 - pill_w;
+            }
+            if py_pill < p.rect().y() {
+                py_pill = cursor.y + 12.0;
+            }
+            p.fill_rect(
+                Rect::new(px_pill, py_pill, pill_w, pill_h),
+                CornerRadius::uniform(4.0),
+                Brush::Solid(style.field_bg),
+            );
+            p.stroke_rect(
+                Rect::new(px_pill, py_pill, pill_w, pill_h),
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(style.field_border),
+            );
+            let mut ts = text_style(style, style.text_primary);
+            ts.baseline = TextBaseline::Middle;
+            p.draw_text(
+                &label_text,
+                &ts,
+                Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+            );
+        }
+    }
+}
+
 #[must_use = "ChartsBuilder is lazy — call .show() / .changed() to paint"]
 pub struct ChartsBuilder<'a, 'b> {
     ui: &'b mut PortalUi<'a>,
