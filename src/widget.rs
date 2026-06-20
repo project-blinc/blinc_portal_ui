@@ -2593,10 +2593,12 @@ impl<'a> PortalUi<'a> {
     }
 }
 
-// Hash-based noise generator. Single Vec<u8> RGBA output for the
-// painter to upload via `draw_rgba_pixels`. Pure CPU; called once
-// per paint. At default 240 × 80 sizes (~19 200 pixels) the cost
-// is well under a frame at 60 Hz.
+// Noise generator backing the NoiseBuilder widget. Single Vec<u8>
+// RGBA output for the painter to upload via `draw_rgba_pixels`.
+// All three variants come from blinc_noise: Perlin wrapped in Fbm
+// for the multi-octave case, Worley + Voronoi for the cellular
+// variants. The earlier inline implementation was upstreamed into
+// blinc_noise so both crates share a single source of truth.
 fn generate_noise(
     variant: NoiseVariant,
     w: u32,
@@ -2607,13 +2609,25 @@ fn generate_noise(
     low: Color,
     high: Color,
 ) -> Vec<u8> {
+    use blinc_noise::{Fbm, Noise2, Perlin, Voronoi, Worley};
+    let seed64 = seed as u64;
+    let perlin = Fbm::new(Perlin::new(seed64)).octaves(octaves.max(1));
+    let worley = Worley::new(seed64);
+    let voronoi = Voronoi::new(seed64);
+
     let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
     for y in 0..h {
         for x in 0..w {
+            let sx = x as f32 / scale;
+            let sy = y as f32 / scale;
+            // Map every variant onto [0, 1] for colour interpolation.
+            // Perlin / Fbm output ~[-1, 1] → remap. Worley + Voronoi
+            // are already [0, 1] but Worley can graze ~1.5 at unit-
+            // cell corners; the trailing clamp catches the overshoot.
             let t = match variant {
-                NoiseVariant::Perlin => perlin_fbm(x as f32 / scale, y as f32 / scale, seed, octaves),
-                NoiseVariant::Worley => worley(x as f32 / scale, y as f32 / scale, seed),
-                NoiseVariant::Voronoi => voronoi(x as f32 / scale, y as f32 / scale, seed),
+                NoiseVariant::Perlin => perlin.sample2(sx, sy) * 0.5 + 0.5,
+                NoiseVariant::Worley => worley.sample2(sx, sy),
+                NoiseVariant::Voronoi => voronoi.sample2(sx, sy),
             };
             let t = t.clamp(0.0, 1.0);
             let r = (low.r + (high.r - low.r) * t).clamp(0.0, 1.0);
@@ -2627,123 +2641,6 @@ fn generate_noise(
         }
     }
     buf
-}
-
-fn hash2(x: i32, y: i32, seed: u32) -> u32 {
-    let mut h = (x as u32)
-        .wrapping_mul(374761393)
-        .wrapping_add((y as u32).wrapping_mul(668265263))
-        .wrapping_add(seed.wrapping_mul(2246822519));
-    h ^= h >> 13;
-    h = h.wrapping_mul(1274126177);
-    h ^= h >> 16;
-    h
-}
-
-fn rand_unit(h: u32) -> f32 {
-    ((h >> 8) as f32) / ((1u32 << 24) as f32)
-}
-
-fn smoothstep(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
-
-// 2D value-grid Perlin-like — gradient interpolation between
-// pseudo-random unit vectors at lattice corners. Single octave;
-// fbm wrapper combines multiple octaves with falling amplitude.
-fn perlin_single(x: f32, y: f32, seed: u32) -> f32 {
-    let xi = x.floor() as i32;
-    let yi = y.floor() as i32;
-    let xf = x - xi as f32;
-    let yf = y - yi as f32;
-    let u = smoothstep(xf);
-    let v = smoothstep(yf);
-
-    let grad = |gx: i32, gy: i32, px: f32, py: f32| -> f32 {
-        let h = hash2(gx, gy, seed);
-        let ang = rand_unit(h) * std::f32::consts::TAU;
-        let dx = ang.cos();
-        let dy = ang.sin();
-        dx * px + dy * py
-    };
-
-    let a = grad(xi, yi, xf, yf);
-    let b = grad(xi + 1, yi, xf - 1.0, yf);
-    let c = grad(xi, yi + 1, xf, yf - 1.0);
-    let d = grad(xi + 1, yi + 1, xf - 1.0, yf - 1.0);
-
-    let ab = a + (b - a) * u;
-    let cd = c + (d - c) * u;
-    let v = ab + (cd - ab) * v;
-    // Gradient noise lands in roughly [-0.707, 0.707]; remap.
-    (v + 0.707) / 1.414
-}
-
-fn perlin_fbm(x: f32, y: f32, seed: u32, octaves: u32) -> f32 {
-    let mut amp = 1.0_f32;
-    let mut freq = 1.0_f32;
-    let mut sum = 0.0_f32;
-    let mut norm = 0.0_f32;
-    for o in 0..octaves {
-        sum += perlin_single(x * freq, y * freq, seed.wrapping_add(o.wrapping_mul(1013))) * amp;
-        norm += amp;
-        amp *= 0.5;
-        freq *= 2.0;
-    }
-    (sum / norm).clamp(0.0, 1.0)
-}
-
-// Worley / cellular distance — distance from (x, y) to the
-// nearest feature point. Feature points sit one-per-cell in the
-// integer lattice; we scan the 3 × 3 neighbourhood around the
-// query cell so the nearest point is always within the window.
-fn worley(x: f32, y: f32, seed: u32) -> f32 {
-    let xi = x.floor() as i32;
-    let yi = y.floor() as i32;
-    let mut best = f32::INFINITY;
-    for ny in -1..=1 {
-        for nx in -1..=1 {
-            let cx = xi + nx;
-            let cy = yi + ny;
-            let h = hash2(cx, cy, seed);
-            let fx = (cx as f32) + rand_unit(h);
-            let fy = (cy as f32) + rand_unit(h.wrapping_mul(2654435761));
-            let dx = fx - x;
-            let dy = fy - y;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d < best {
-                best = d;
-            }
-        }
-    }
-    best.clamp(0.0, 1.0)
-}
-
-// Voronoi cell colouring — same feature points as Worley, but
-// the value is a hash of the nearest cell's id (each cell renders
-// at a single flat shade).
-fn voronoi(x: f32, y: f32, seed: u32) -> f32 {
-    let xi = x.floor() as i32;
-    let yi = y.floor() as i32;
-    let mut best = f32::INFINITY;
-    let mut best_h = 0u32;
-    for ny in -1..=1 {
-        for nx in -1..=1 {
-            let cx = xi + nx;
-            let cy = yi + ny;
-            let h = hash2(cx, cy, seed);
-            let fx = (cx as f32) + rand_unit(h);
-            let fy = (cy as f32) + rand_unit(h.wrapping_mul(2654435761));
-            let dx = fx - x;
-            let dy = fy - y;
-            let d = dx * dx + dy * dy;
-            if d < best {
-                best = d;
-                best_h = h;
-            }
-        }
-    }
-    rand_unit(best_h)
 }
 
 // ─────────────────────────────────────────────────────────────────────

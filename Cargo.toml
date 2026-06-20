@@ -46,6 +46,12 @@ ahash = "0.8"
 # Diagnostic logging. `tracing` is the workspace convention.
 tracing = "0.1"
 
+# Noise generators backing the `NoiseBuilder` widget. Perlin / Fbm
+# come from blinc_noise's shipped surface; Worley + Voronoi were
+# upstreamed there from this crate's earlier inline implementation
+# so both crates share a single source of truth.
+blinc_noise = { git = "https://github.com/project-blinc/blinc_noise.git", rev = "3dd61c1eee31f89b00ad15e1484acbc9036af5da" }
+
 # Match the Blinc workspace pin — see blinc_node_editor/Cargo.toml for
 # the wgpu-hal regression rationale.
 wgpu-hal = "=26.0.5"
@@ -64,3 +70,8 @@ blinc_animation = { path = "../../crates/blinc_animation" }
 # dep to the colocated checkout for source-local development.
 [patch."https://github.com/project-blinc/blinc_canvas_kit.git"]
 blinc_canvas_kit = { path = "../blinc_canvas_kit" }
+
+# blinc_noise sibling — same pattern, redirect git URL to the local
+# packages/ checkout when developing source-local.
+[patch."https://github.com/project-blinc/blinc_noise.git"]
+blinc_noise = { path = "../blinc_noise" }
