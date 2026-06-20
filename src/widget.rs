@@ -656,11 +656,12 @@ pub enum ChartDecimation {
 
 /// Pure chart series-paint params for host callers. Drives
 /// [`paint_chart`] — the line / bar / area series + baseline +
-/// latest-marker render, decoupled from the interactive
-/// [`ChartsBuilder`] (no background / shadow / tooltip / PiP
-/// button). Lets a host paint the same chart from a plain
-/// `blinc_layout::canvas` closure via [`PortalPainter::for_host`],
-/// e.g. a PiP popover showing the expanded series.
+/// latest-marker render + an opt-in hover tooltip
+/// (`tooltip_cursor`), decoupled from the interactive
+/// [`ChartsBuilder`] (no background / shadow / PiP button). Lets a
+/// host paint the same chart from a plain `blinc_layout::canvas`
+/// closure via [`PortalPainter::for_host`], e.g. a PiP popover
+/// showing the expanded series with tooltips.
 ///
 /// The render core is intentionally a sibling of `ChartsBuilder::show`
 /// rather than a shared extraction: `show` threads the same `lo`/`hi`/
@@ -683,6 +684,18 @@ pub struct ChartPaint {
     /// Opacity multiplier on the resolved series colours (1.0 =
     /// opaque; lower to render a disabled / ghosted chart).
     pub alpha: f32,
+    /// Cursor position in the painter's coordinate space (same
+    /// space as the `plot` rect passed to [`paint_chart`]). When
+    /// `Some` and inside the plot, a hover crosshair + value pill
+    /// are drawn at the nearest sample. Hosts feed this from a
+    /// `div().on_mouse_move(|ctx| ...)` over the canvas using
+    /// `ctx.local_x` / `ctx.local_y`. `None` = no tooltip.
+    pub tooltip_cursor: Option<Point>,
+    /// Decimal precision for the tooltip value; `None` auto-picks
+    /// from the data range.
+    pub tooltip_precision: Option<u8>,
+    /// Unit suffix appended to the tooltip value ("ms", "%", ...).
+    pub tooltip_unit: Option<String>,
 }
 
 impl Default for ChartPaint {
@@ -700,6 +713,9 @@ impl Default for ChartPaint {
             fill_color: None,
             baseline_color: None,
             alpha: 1.0,
+            tooltip_cursor: None,
+            tooltip_precision: None,
+            tooltip_unit: None,
         }
     }
 }
@@ -909,14 +925,91 @@ pub fn paint_chart(
             }
         }
     }
+
+    // ── Hover tooltip ────────────────────────────────────────
+    // Opt-in via `tooltip_cursor`. Mirrors ChartsBuilder::show's
+    // hover pass: map cursor x → nearest sample, draw a 1 px
+    // crosshair + sample dot + a value pill clamped to the plot.
+    if let Some(cursor) = opts.tooltip_cursor {
+        let cur_x = cursor.x;
+        let cur_y = cursor.y;
+        if cur_x >= plot_x && cur_x <= plot_x + plot_w && n > 0 {
+            let idx = if n == 1 {
+                0
+            } else {
+                let t = (cur_x - plot_x) / plot_w;
+                ((t.clamp(0.0, 1.0)) * (n - 1) as f32).round() as usize
+            };
+            let val = samples[idx];
+            let sample_x = x_of(idx);
+            let sample_y = y_of(val);
+
+            p.fill_rect(
+                Rect::new(sample_x - 0.5, plot_y, 1.0, plot_h),
+                CornerRadius::uniform(0.0),
+                Brush::Solid(stroke_brush.with_alpha(0.4)),
+            );
+            p.fill_circle(
+                Point::new(sample_x, sample_y),
+                opts.line_width + 1.0,
+                Brush::Solid(stroke_brush),
+            );
+
+            let precision = opts.tooltip_precision.unwrap_or_else(|| {
+                if span.abs() < 1.0 {
+                    3
+                } else if span.abs() < 100.0 {
+                    2
+                } else {
+                    1
+                }
+            });
+            let formatted = format!("{:.1$}", val, precision as usize);
+            let label_text = match &opts.tooltip_unit {
+                Some(u) => format!("{}{}", formatted, u),
+                None => formatted,
+            };
+
+            let pad_x = 6.0_f32;
+            let pill_h = 18.0_f32;
+            let label_w = approx_text_width(&label_text, style);
+            let pill_w = label_w + 2.0 * pad_x;
+            let mut px_pill = sample_x + 8.0;
+            let mut py_pill = cur_y - pill_h - 8.0;
+            if px_pill + pill_w > plot_x + plot_w {
+                px_pill = sample_x - 8.0 - pill_w;
+            }
+            if py_pill < plot_y {
+                py_pill = cur_y + 8.0;
+            }
+            p.fill_rect(
+                Rect::new(px_pill, py_pill, pill_w, pill_h),
+                CornerRadius::uniform(4.0),
+                Brush::Solid(style.field_bg),
+            );
+            p.stroke_rect(
+                Rect::new(px_pill, py_pill, pill_w, pill_h),
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(style.field_border),
+            );
+            let mut ts = text_style(style, style.text_primary);
+            ts.baseline = TextBaseline::Middle;
+            p.draw_text(
+                &label_text,
+                &ts,
+                Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+            );
+        }
+    }
 }
 
 /// Pure pie/donut paint params for host callers. Drives
 /// [`paint_pie`] — the slice wedges + optional donut hole + slice-
 /// gap seams, decoupled from the interactive [`PieChartBuilder`]
-/// (no background / shadow / tooltip / PiP button). Sibling of
-/// `PieChartBuilder::show`'s render core; keep in sync when the
-/// slice math changes.
+/// (no background / shadow / PiP button) plus an opt-in hover
+/// tooltip (`tooltip_cursor`). Sibling of `PieChartBuilder::show`'s
+/// render core; keep in sync when the slice math changes.
 #[derive(Clone)]
 pub struct PiePaint {
     /// Donut hole as a fraction of the outer radius (0 = solid pie).
@@ -930,6 +1023,13 @@ pub struct PiePaint {
     pub gap_bg: Option<Color>,
     /// Opacity multiplier on slice colours (1.0 = opaque).
     pub alpha: f32,
+    /// Cursor in the painter's coordinate space. When `Some` and
+    /// over a slice (inside the ring), a pill shows that slice's
+    /// weight + share-of-total. Hosts feed this from
+    /// `div().on_mouse_move(|ctx| ...)`. `None` = no tooltip.
+    pub tooltip_cursor: Option<Point>,
+    /// Unit suffix on the tooltip weight ("ms", "%", ...).
+    pub tooltip_unit: Option<String>,
 }
 
 impl Default for PiePaint {
@@ -940,6 +1040,8 @@ impl Default for PiePaint {
             slice_gap: 0.0,
             gap_bg: None,
             alpha: 1.0,
+            tooltip_cursor: None,
+            tooltip_unit: None,
         }
     }
 }
@@ -982,6 +1084,7 @@ pub fn paint_pie(
         a0: f32,
         a1: f32,
         color: Color,
+        weight: f32,
     }
     let mut spans: Vec<Slice> = Vec::with_capacity(weights.len());
     let mut acc = 0.0_f32;
@@ -1000,7 +1103,12 @@ pub fn paint_pie(
             .map(|c| c.with_alpha(a))
             .unwrap_or_else(|| default_color(slice_idx));
         slice_idx += 1;
-        spans.push(Slice { a0, a1, color });
+        spans.push(Slice {
+            a0,
+            a1,
+            color,
+            weight: w,
+        });
     }
 
     for slice in &spans {
@@ -1044,6 +1152,59 @@ pub fn paint_pie(
                     .move_to(inner_pt.x, inner_pt.y)
                     .line_to(outer_pt.x, outer_pt.y);
                 p.stroke_path(&gap_path, &Stroke::new(opts.slice_gap), Brush::Solid(bg));
+            }
+        }
+    }
+
+    // ── Hover tooltip ────────────────────────────────────────
+    // Opt-in via `tooltip_cursor`. Hit-test the cursor against the
+    // ring (inner_r..outer_r) + each slice's angular span; show the
+    // slice weight + share-of-total in a pill near the cursor.
+    if let Some(cursor) = opts.tooltip_cursor {
+        let dx = cursor.x - cx;
+        let dy = cursor.y - cy;
+        let r = (dx * dx + dy * dy).sqrt();
+        if r >= inner_r && r <= outer_r + 0.5 {
+            let mut ang = dy.atan2(dx);
+            while ang < start_offset {
+                ang += two_pi;
+            }
+            if let Some(slice) = spans.iter().find(|s| ang >= s.a0 && ang <= s.a1) {
+                let pct = slice.weight / total * 100.0;
+                let formatted = format!("{:.2}", slice.weight);
+                let label = match &opts.tooltip_unit {
+                    Some(u) => format!("{}{} ({:.0}%)", formatted, u, pct),
+                    None => format!("{} ({:.0}%)", formatted, pct),
+                };
+                let pad_x = 6.0_f32;
+                let pill_h = 18.0_f32;
+                let pill_w = approx_text_width(&label, style) + 2.0 * pad_x;
+                let mut px_pill = cursor.x + 12.0;
+                let mut py_pill = cursor.y - pill_h - 8.0;
+                if px_pill + pill_w > p.rect().x() + p.rect().width() {
+                    px_pill = cursor.x - 12.0 - pill_w;
+                }
+                if py_pill < p.rect().y() {
+                    py_pill = cursor.y + 12.0;
+                }
+                p.fill_rect(
+                    Rect::new(px_pill, py_pill, pill_w, pill_h),
+                    CornerRadius::uniform(4.0),
+                    Brush::Solid(style.field_bg),
+                );
+                p.stroke_rect(
+                    Rect::new(px_pill, py_pill, pill_w, pill_h),
+                    CornerRadius::uniform(4.0),
+                    &Stroke::new(1.0),
+                    Brush::Solid(style.field_border),
+                );
+                let mut ts = text_style(style, style.text_primary);
+                ts.baseline = TextBaseline::Middle;
+                p.draw_text(
+                    &label,
+                    &ts,
+                    Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                );
             }
         }
     }
