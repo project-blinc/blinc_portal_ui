@@ -89,8 +89,11 @@ ui.numeric_input(&n)
 
 Single-line text editor bound to `String`. Click to focus, type to
 edit, Esc / click elsewhere to release. Backspace, Delete, Home,
-End, arrow keys all behave. Hosts must install `install_kbd_hook`
-on the canvas div to feed key events into the portal.
+End, arrow keys all behave. **Selection**: drag to select, shift+click
+to extend, shift+arrow / shift+Home/End to extend by keyboard; typing
+or Backspace/Delete replaces the selection. Hosts must install
+`install_kbd_hook` on the canvas div to feed key events into the portal.
+Clipboard (Cmd+C/V/X) and IME composition are not yet wired.
 
 ```rust
 let label = ctx.use_state(|| String::new());
@@ -103,8 +106,9 @@ Multi-line text editor bound to `String`. Like `text_input` but
 Enter inserts a newline (doesn't blur), Up/Down move the caret
 between lines preserving the horizontal position, and Home/End act
 on the current line. `.rows(n)` sets the visible height (default 4);
-content beyond `rows` scrolls with the caret. Same `install_kbd_hook`
-requirement as `text_input`.
+content beyond `rows` scrolls with the caret. Drag-to-select spans
+lines (shift+click and shift+Up/Down extend); selection-replace on
+edit. Same `install_kbd_hook` requirement as `text_input`.
 
 ```rust
 let notes = ctx.use_state(|| String::new());

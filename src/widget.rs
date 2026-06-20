@@ -6455,6 +6455,12 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                 }
             }
 
+            // The pointer/drag handling above may have moved `caret`
+            // (a multi-line drag drops it onto a different row), so the
+            // `caret_line` computed before that handling is stale.
+            // Recompute from the settled caret — `caret_row` guarantees
+            // `starts[row] <= caret`, keeping `current[ls..caret]` valid.
+            let (caret_line, _) = caret_row(&starts, caret);
             if focused && caret_line >= first_visible && caret_line < first_visible + rows {
                 let ls = starts[caret_line];
                 let caret_x = text_x + text_width(&current[ls..caret], &style);
