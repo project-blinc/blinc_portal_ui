@@ -5660,6 +5660,20 @@ struct TextInputState {
     /// vertical caret moves (Up/Down, shift+Up/Down) so repeated
     /// jumps don't drift toward column 0 on short lines.
     goal_col_x: f32,
+    /// textarea only: user-chosen box width / height in pixels once
+    /// the resize grip has been dragged. `0.0` means "never resized —
+    /// use the builder-derived size". Persisted so the box keeps its
+    /// dragged size across frames.
+    user_w: f32,
+    user_h: f32,
+    /// textarea only: true between the pointer-down and pointer-up of
+    /// a resize-grip drag (the analogue of `dragging` for text select).
+    resizing: bool,
+    /// textarea only: pixel offset between the box's bottom-right
+    /// corner and the cursor at the moment the grip was grabbed, so
+    /// the corner tracks the cursor without a jump on the first frame.
+    grab_dx: f32,
+    grab_dy: f32,
 }
 
 #[must_use = "TextInputBuilder is lazy — call .show() / .changed() to paint"]
@@ -6050,6 +6064,7 @@ impl<'a> PortalUi<'a> {
             width_override: None,
             rows: 4,
             shadow_token: None,
+            resize: None,
         }
     }
 }
@@ -6090,6 +6105,19 @@ fn caret_row(starts: &[usize], caret: usize) -> (usize, usize) {
     (row, starts[row])
 }
 
+/// Which edges of a [`TextareaBuilder`] expose a drag-resize grip.
+/// Mirrors CSS `resize`; the grip always sits in the bottom-right
+/// corner and drives the enabled axis (or both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeDir {
+    /// Drag changes height only (the common, layout-stable case).
+    Vertical,
+    /// Drag changes width only.
+    Horizontal,
+    /// Drag changes both width and height.
+    Both,
+}
+
 #[must_use = "TextareaBuilder is lazy — call .show() / .changed() to paint"]
 pub struct TextareaBuilder<'a, 'b> {
     ui: &'b mut PortalUi<'a>,
@@ -6099,6 +6127,7 @@ pub struct TextareaBuilder<'a, 'b> {
     width_override: Option<f32>,
     rows: usize,
     shadow_token: Option<ShadowToken>,
+    resize: Option<ResizeDir>,
 }
 
 impl<'a, 'b> ShadowMix for TextareaBuilder<'a, 'b> {
@@ -6128,6 +6157,19 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
         self.rows = n.max(1);
         self
     }
+    /// Expose a drag-resize grip in the bottom-right corner. The
+    /// `rows` / `width` settings become the initial size; once the
+    /// user drags the grip the chosen size is remembered for as long
+    /// as the widget keeps rendering (the size lives in the same
+    /// per-widget storage as the caret, so hiding the textarea for a
+    /// frame — a collapsed panel, a tab switch — drops it back to the
+    /// builder size on re-show). [`ResizeDir::Vertical`] is the usual
+    /// choice — it grows the visible line count without disturbing the
+    /// surrounding column width.
+    pub fn resizable(mut self, dir: ResizeDir) -> Self {
+        self.resize = Some(dir);
+        self
+    }
 
     pub fn show(self) -> Response {
         use blinc_core::events::KeyCode;
@@ -6140,14 +6182,35 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
             width_override,
             rows,
             shadow_token,
+            resize,
         } = self;
         let style = ui.style.clone();
-        let (avail_w, _) = ui.available_size();
-        let width = width_override.unwrap_or_else(|| avail_w.clamp(80.0, 320.0));
+        let (avail_w, _avail_h) = ui.available_size();
         let pad_h = 8.0_f32;
         let pad_v = 6.0_f32;
         let line_h = style.line_height;
-        let height = rows as f32 * line_h + 2.0 * pad_v;
+        let base_w = width_override.unwrap_or_else(|| avail_w.clamp(80.0, 320.0));
+        let base_h = rows as f32 * line_h + 2.0 * pad_v;
+
+        // Resize-grip plumbing. `resize_w` / `resize_h` gate which axis
+        // the bottom-right grip drives; the clamps bound the dragged
+        // size. Width is capped at the available column so a grow can't
+        // overflow the layout; height tops out at 40 rows.
+        let (resize_w, resize_h) = match resize {
+            Some(ResizeDir::Both) => (true, true),
+            Some(ResizeDir::Horizontal) => (true, false),
+            Some(ResizeDir::Vertical) => (false, true),
+            None => (false, false),
+        };
+        // `min_w` never exceeds the starting width (a deliberately
+        // narrow `.width(w<80)` box keeps its size and only grows — no
+        // snap-up on first grab), and the `.max(min_w)` floors keep
+        // `min <= max` so `f32::clamp` can't panic when `avail_w` is
+        // below 80 in a tight container.
+        let min_w = 80.0_f32.min(base_w);
+        let max_w = avail_w.max(base_w).max(min_w);
+        let min_h = line_h + 2.0 * pad_v;
+        let max_h = (40.0 * line_h + 2.0 * pad_v).max(base_h).max(min_h);
 
         let widget_id = ui.make_widget_id(None);
         let portal_id = ui.portal_id;
@@ -6164,8 +6227,39 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
         let mut drag_moved = st0.drag_moved;
         let mut pre_caret = clamp_boundary(&current, st0.pre_caret);
         let mut goal_col_x = st0.goal_col_x;
+        let mut user_w = st0.user_w;
+        let mut user_h = st0.user_h;
+        let mut resizing = st0.resizing;
+        let mut grab_dx = st0.grab_dx;
+        let mut grab_dy = st0.grab_dy;
         let mut changed = false;
         let mut release_focus = false;
+        // Set when a resize was in progress this frame so the click the
+        // kit reports on grip release is not forwarded to the caller as
+        // `Response::clicked` (it isn't a content click).
+        let mut suppress_click = false;
+
+        // Apply the persisted resize. A dragged size set this frame
+        // takes effect next frame (the painter is allocated below at
+        // the size read here) — one frame at 60fps, imperceptible
+        // mid-drag. `rows` is re-derived from the box height so a
+        // taller box reveals more lines.
+        let width = if resize_w && user_w > 0.0 {
+            user_w.clamp(min_w, max_w)
+        } else {
+            base_w
+        };
+        let (height, rows) = if resize_h && user_h > 0.0 {
+            let h = user_h.clamp(min_h, max_h);
+            let r = (((h - 2.0 * pad_v) / line_h) + 0.001).floor().max(1.0) as usize;
+            // Snap the drawn height to whole rows so the box stays flush
+            // with the text it shows (no sub-row dead strip at the
+            // bottom). `user_h` itself stays continuous for smooth grip
+            // tracking.
+            (r as f32 * line_h + 2.0 * pad_v, r)
+        } else {
+            (base_h, rows)
+        };
 
         if focused {
             let keys: Vec<crate::ui::KbdKey> = ui.kbd_keys_frame.to_vec();
@@ -6330,23 +6424,63 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                 ls + caret_from_click_x(line, &style, local.x - pad_h)
             };
 
+            // Hit zone for the resize grip — bottom-right corner,
+            // capped so it never dominates a short/narrow box (it would
+            // otherwise swallow caret-placement clicks on the last row).
+            let grip_sz = 18.0_f32.min(width * 0.4).min(height * 0.4);
+            let on_grip = |l: Point| -> bool {
+                (resize_w || resize_h) && l.x >= width - grip_sz && l.y >= height - grip_sz
+            };
             if !disabled {
-                if !dragging {
+                // Captured before the release branch clears it, so the
+                // click that fires on release of a resize-grip drag is
+                // suppressed (otherwise it would drop the caret at the
+                // grip corner).
+                let was_resizing = resizing;
+                if !dragging && !resizing {
                     pre_caret = caret;
                 }
-                if r.pressed && !dragging {
-                    crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
-                    dragging = true;
-                    drag_moved = false;
-                    pre_caret = caret;
-                    if let Some(l) = r.pointer_local {
-                        drag_start = to_pos(l);
+                if r.pressed && !dragging && !resizing {
+                    // Down edge: grip corner starts a resize; anywhere
+                    // else starts a text-selection drag.
+                    let grip_press = r.pointer_local.map(on_grip).unwrap_or(false);
+                    if grip_press {
+                        resizing = true;
+                        // Keep edit focus while resizing — a grip press
+                        // is a POINTER_DOWN, which the global click hook
+                        // treats as a blur; re-assert focus so the caret
+                        // and keyboard survive the drag (mirrors the
+                        // text-drag branch below).
+                        crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+                        if let Some(l) = r.pointer_local {
+                            grab_dx = width - l.x;
+                            grab_dy = height - l.y;
+                        }
                     } else {
-                        drag_start = caret;
+                        crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+                        dragging = true;
+                        drag_moved = false;
+                        pre_caret = caret;
+                        if let Some(l) = r.pointer_local {
+                            drag_start = to_pos(l);
+                        } else {
+                            drag_start = caret;
+                        }
+                        caret = drag_start;
+                        anchor = drag_start;
+                        goal_col_x = 0.0;
                     }
-                    caret = drag_start;
-                    anchor = drag_start;
-                    goal_col_x = 0.0;
+                } else if r.pressed && resizing {
+                    // The grip corner tracks the cursor (plus the grab
+                    // offset). Persisted size applies on the next frame.
+                    if let Some(l) = r.pointer_local {
+                        if resize_w {
+                            user_w = (l.x + grab_dx).clamp(min_w, max_w);
+                        }
+                        if resize_h {
+                            user_h = (l.y + grab_dy).clamp(min_h, max_h);
+                        }
+                    }
                 } else if r.pressed && dragging {
                     if let Some(l) = r.pointer_local {
                         let p2 = to_pos(l);
@@ -6358,10 +6492,15 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                             caret = p2;
                         }
                     }
-                } else if !r.pressed && dragging {
+                } else if !r.pressed {
                     dragging = false;
+                    resizing = false;
                 }
-                if r.clicked && !drag_moved {
+                // A resize this frame (in progress or just released)
+                // swallows the kit's click so it neither places the
+                // caret nor leaks out as `Response::clicked`.
+                suppress_click = resizing || was_resizing;
+                if r.clicked && !drag_moved && !suppress_click {
                     if let Some(l) = r.pointer_local {
                         let p2 = to_pos(l);
                         if r.click_shift {
@@ -6376,6 +6515,14 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                         goal_col_x = 0.0;
                     }
                 }
+            } else {
+                // Disabled mid-interaction (e.g. a form locks while
+                // submitting): the block above never runs, so clear the
+                // transient flags here. Otherwise a latched `resizing`
+                // would pin `request_animation()` and spin the
+                // compositor for the whole disabled window.
+                dragging = false;
+                resizing = false;
             }
 
             if let Some(tok) = shadow_token {
@@ -6475,6 +6622,29 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                     Brush::Solid(style.text_primary),
                 );
             }
+
+            // Resize grip — a small bottom-right corner hatch, drawn
+            // last so it reads above the text. Brightens while the
+            // grip is being dragged.
+            if (resize_w || resize_h) && !disabled {
+                let gx = p.rect().x() + p.rect().width() - 3.0;
+                let gy = p.rect().y() + p.rect().height() - 3.0;
+                let grip_col = if resizing {
+                    style.field_border_focus
+                } else {
+                    style.field_border
+                };
+                // Scale the hatch to the (possibly capped) hit zone so
+                // the affordance matches what's actually grabbable.
+                let g = (grip_sz - 3.0).max(4.0);
+                for i in 0..2 {
+                    let off = g * 0.45 + i as f32 * g * 0.35;
+                    let path = blinc_core::draw::Path::new()
+                        .move_to(gx - off, gy)
+                        .line_to(gx, gy - off);
+                    p.stroke_path(&path, &Stroke::new(1.5), Brush::Solid(grip_col));
+                }
+            }
         }
 
         caret = caret.min(current.len());
@@ -6490,9 +6660,14 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
             st.drag_moved = drag_moved;
             st.pre_caret = pre_caret.min(current.len());
             st.goal_col_x = goal_col_x;
+            st.user_w = user_w;
+            st.user_h = user_h;
+            st.resizing = resizing;
+            st.grab_dx = grab_dx;
+            st.grab_dy = grab_dy;
         }
 
-        if focused || dragging {
+        if !disabled && (focused || dragging || resizing) {
             ui.request_animation();
         }
         if changed {
@@ -6502,7 +6677,7 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
         let mut resp = Response::empty();
         resp.rect = resp_rect;
         resp.hovered = resp_hovered;
-        resp.clicked = resp_clicked;
+        resp.clicked = resp_clicked && !suppress_click;
         resp.changed = changed;
         resp.widget_id = widget_id;
         resp

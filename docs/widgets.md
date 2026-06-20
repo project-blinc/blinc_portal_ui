@@ -110,9 +110,21 @@ content beyond `rows` scrolls with the caret. Drag-to-select spans
 lines (shift+click and shift+Up/Down extend); selection-replace on
 edit. Same `install_kbd_hook` requirement as `text_input`.
 
+`.resizable(ResizeDir)` exposes a drag grip in the bottom-right
+corner. `ResizeDir::Vertical` grows the box height (revealing more
+lines) without disturbing the column width; `Horizontal` and `Both`
+are also available. The dragged size is remembered per widget for
+the life of the portal. The grip occupies the bottom-right ~18px, so
+clicks there resize rather than place the caret.
+
 ```rust
+use blinc_portal_ui::ResizeDir;
 let notes = ctx.use_state(|| String::new());
-ui.textarea(&notes).rows(6).placeholder("Notes…").show();
+ui.textarea(&notes)
+    .rows(6)
+    .placeholder("Notes…")
+    .resizable(ResizeDir::Vertical)
+    .show();
 ```
 
 ## file_picker
