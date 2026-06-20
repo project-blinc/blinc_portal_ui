@@ -1,11 +1,15 @@
 //! Immediate-mode widget toolkit for canvas closures.
 //!
-//! A `Portal` is a host-owned runtime keyed by a stable id (a node id,
-//! a panel id) that drives one rectangular slice of an existing canvas
-//! every frame. The closure handed to [`Portal::frame`] paints widgets
-//! into the slice via a per-frame [`PortalUi`], registers hit regions
-//! with the host's `CanvasKit`, and reads back interaction state — all
-//! synchronously, no retained tree.
+//! A [`Portal`] is a host-owned runtime keyed by a stable id (a node
+//! id, a panel id) that drives one rectangular slice of an existing
+//! canvas every frame. Open a frame with the typed-builder
+//! [`Portal::begin`] (`.style(...).host(...).clip_radius(...).run(|ui|
+//! ...)`); the closure paints widgets into the slice via a per-frame
+//! [`PortalUi`], registers hit regions with the host's `CanvasKit`,
+//! and reads back interaction state — all synchronously, no retained
+//! tree. The terminal `.run(...)` returns a [`FrameOutcome`] with
+//! `needs_redraw()` + `natural_width()` / `natural_height()` for
+//! hosts driving fit-content sizing.
 //!
 //! Three pieces compose: [`PortalStyle`] supplies theme-derived colours
 //! and metrics, [`HostBridge`] supplies coordinate transforms so widgets
@@ -13,6 +17,15 @@
 //! the per-widget scratch state (slider drag offset, hover ease t) that
 //! frame-to-frame continuity needs. Built-in widgets ([`widget`] module)
 //! consume all three; custom widgets can ignore any of them.
+//!
+//! The built-in catalog covers input widgets (label, button, switch,
+//! slider, numeric_input, text_input, color_picker, select) plus a
+//! square-aspect display-portal family (chart / pie_chart /
+//! radar_chart / noise / texture / sdf_shape) that all support a
+//! `.pip(true)` corner button — the host wires `Response.pip_clicked`
+//! to an overlay popover for the expanded view. See the crate
+//! `README.md` for the widget catalog, PiP recipe, and fit-content
+//! sizing pattern.
 
 pub mod color_wheel;
 pub mod core;
