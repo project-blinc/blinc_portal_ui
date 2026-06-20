@@ -30,8 +30,11 @@ let outcome = portal
 - **[Host integration](docs/integration.md)** — module map, the
   frame contract, click + keyboard hook installation, overlay
   anchoring, fit-content sizing via
-  `FrameOutcome::natural_width/height`, PiP popovers, signal
-  lifecycle, custom widgets.
+  `FrameOutcome::natural_width/height`, PiP popovers,
+  [theme integration](docs/integration.md#theme-integration)
+  (per-frame `PortalStyle::from_active_theme` + per-portal
+  overrides + ShadowToken resolution), signal lifecycle, custom
+  widgets.
 
 ## Imgui, not retained mode
 
