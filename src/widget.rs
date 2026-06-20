@@ -3408,20 +3408,21 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             }
             _ if shape.is_3d() => {
                 // ─── 3D variants ──────────────────────────────
-                // Inscribed 80 % square + scissor clip on the
-                // inner rect. The clip is the hard guarantee
-                // against overshoot (worst-case 45° y-rotation
-                // grows the box silhouette by ~√2 ×); the 0.80
-                // inset gives breathing room before the clip
-                // ever kicks in, so the typical case reads as
-                // a clean inscribed shape, not a clipped slice.
+                // Inscribed 65 % square + scissor clip on the
+                // inner rect. The 65 % factor leaves room for
+                // the rotated silhouette to fit cleanly inside
+                // the widget border — a 40° y-rotated box has
+                // a ~1.4 × footprint, and a tilted cylinder /
+                // torus extends vertically beyond its xy
+                // bounds. The clip remains as the hard upper
+                // bound for shapes with steeper rotation
+                // overrides than the defaults.
                 //
                 // Depth equals `depth_input × sq` (depth scale
-                // 1.0) so the shape carries full z-extent — at
-                // lower depth scales (e.g. 0.7) the box / torus
-                // shading flattens and the silhouette reads
+                // 1.0) so the shape carries full z-extent —
+                // lower depth scales flatten the shading + read
                 // smudged at oblique angles.
-                let sq = min_side * 0.80;
+                let sq = min_side * 0.65;
                 let shape_rect = Rect::new(
                     inner.x() + (inner.width() - sq) * 0.5,
                     inner.y() + (inner.height() - sq) * 0.5,
