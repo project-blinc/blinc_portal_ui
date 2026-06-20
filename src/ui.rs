@@ -40,9 +40,12 @@ use web_time::Instant;
 /// portal frame consumes its entry on read (`map.remove(...)`),
 /// so a click fires exactly once for the next widget paint that
 /// observes it.
-static CLICKS: OnceLock<Mutex<ahash::AHashMap<String, Instant>>> = OnceLock::new();
+static CLICKS: OnceLock<
+    Mutex<ahash::AHashMap<String, (Instant, blinc_canvas_kit::CanvasModifiers)>>,
+> = OnceLock::new();
 
-fn clicks() -> &'static Mutex<ahash::AHashMap<String, Instant>> {
+fn clicks() -> &'static Mutex<ahash::AHashMap<String, (Instant, blinc_canvas_kit::CanvasModifiers)>>
+{
     CLICKS.get_or_init(|| Mutex::new(ahash::AHashMap::default()))
 }
 
@@ -61,7 +64,7 @@ fn sweep_stale_clicks() {
         return;
     }
     let now = Instant::now();
-    map.retain(|_, stamped| now.duration_since(*stamped).as_millis() < CLICK_STAMP_MAX_AGE_MS);
+    map.retain(|_, (stamped, _)| now.duration_since(*stamped).as_millis() < CLICK_STAMP_MAX_AGE_MS);
 }
 
 /// Install the kit-side click recorder. Hosts call this ONCE after
@@ -76,7 +79,10 @@ fn sweep_stale_clicks() {
 pub fn install_click_hook(kit: &mut CanvasKit) {
     kit.add_click_listener(|evt: &CanvasEvent| {
         if let Some(id) = &evt.region_id {
-            clicks().lock().unwrap().insert(id.clone(), Instant::now());
+            clicks()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), (Instant::now(), evt.modifiers));
         }
     });
     // Blur-on-click-outside. Every POINTER_DOWN clears the
@@ -1066,8 +1072,13 @@ impl<'a> PortalUi<'a> {
                 // with the same id re-renders, which is the
                 // imgui-norm "if you don't ask for it this frame,
                 // you don't get it" semantics.
-                let clicked = matches!(sense, Sense::Click | Sense::Drag)
-                    && clicks().lock().unwrap().remove(&region_id).is_some();
+                let click_entry = if matches!(sense, Sense::Click | Sense::Drag) {
+                    clicks().lock().unwrap().remove(&region_id)
+                } else {
+                    None
+                };
+                let clicked = click_entry.is_some();
+                let click_shift = click_entry.map(|(_, m)| m.shift).unwrap_or(false);
 
                 response = build_response(
                     rect,
@@ -1076,6 +1087,7 @@ impl<'a> PortalUi<'a> {
                     clicked,
                     pointer_world,
                     drag_delta_local,
+                    click_shift,
                 );
                 response.widget_id = widget_id;
             }

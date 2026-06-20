@@ -242,6 +242,11 @@ pub struct Response {
     /// of the widget in a popover. `false` for every widget that
     /// doesn't expose a PiP affordance.
     pub pip_clicked: bool,
+    /// Whether Shift was held when the click that set `clicked` fired.
+    /// Sourced from the canvas event's modifiers (captured by
+    /// `install_click_hook`). Used by text widgets for shift+click
+    /// selection extension. `false` when `clicked` is `false`.
+    pub click_shift: bool,
 }
 
 impl Response {
@@ -260,6 +265,7 @@ impl Response {
             drag_delta_local: Point::new(0.0, 0.0),
             widget_id: WidgetId::default(),
             pip_clicked: false,
+            click_shift: false,
         }
     }
 

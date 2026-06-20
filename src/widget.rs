@@ -5625,13 +5625,41 @@ fn format_numeric(value: f32, precision: u8, integer: bool) -> String {
 // node-editor inspector path that drives this work.
 // ─────────────────────────────────────────────────────────────────────
 
-/// Per-widget cursor state stored in [`PortalStorage`].
+/// Per-widget caret + selection state stored in [`PortalStorage`].
+/// Shared by `text_input` and `textarea`.
 #[derive(Debug, Default, Clone, Copy)]
 struct TextInputState {
-    /// Byte offset of the caret in the owning `String`. Clamped on
-    /// every read to `value.len()` so external mutations that
-    /// shorten the string don't leave a dangling cursor.
+    /// Byte offset of the caret (the moving end of a selection).
+    /// Clamped on every read to `value.len()` so external mutations
+    /// that shorten the string don't leave a dangling cursor.
     caret: usize,
+    /// Byte offset of the selection anchor (the fixed end). Equal to
+    /// `caret` when there is no selection. The selected range is
+    /// always `min(anchor, caret)..max(anchor, caret)`.
+    anchor: usize,
+    /// True between the pointer-down and pointer-up of a press over
+    /// this widget — drives the drag-select edge detection (the
+    /// widget never sees raw down/up events, only the per-frame
+    /// `pressed` level, so the edges are recovered by diffing).
+    dragging: bool,
+    /// Caret byte the current press started at; the drag selection
+    /// runs from here to the live pointer.
+    drag_start: usize,
+    /// Set once the pointer moves off `drag_start` during a press —
+    /// distinguishes a drag (live selection) from a plain click
+    /// (caret place / shift-extend, decided on release).
+    drag_moved: bool,
+    /// Caret byte just before the current press began. shift+click
+    /// extends the selection from here to the click point — the
+    /// pointer-down edge can't see Shift (the click event with its
+    /// modifiers only arrives on release), so the pre-press caret is
+    /// stashed on down and consulted when the release turns out to
+    /// be a shift-click.
+    pre_caret: usize,
+    /// textarea only: preserved horizontal pixel target for
+    /// vertical caret moves (Up/Down, shift+Up/Down) so repeated
+    /// jumps don't drift toward column 0 on short lines.
+    goal_col_x: f32,
 }
 
 #[must_use = "TextInputBuilder is lazy — call .show() / .changed() to paint"]
@@ -5686,60 +5714,107 @@ impl<'a, 'b> TextInputBuilder<'a, 'b> {
         let focused = !disabled && ui.is_focused(widget_id);
 
         let mut current = value.get();
-        let mut caret = ui
+        let st0 = *ui
             .storage
-            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
-            .caret
-            .min(current.len());
+            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default);
+        let mut caret = clamp_boundary(&current, st0.caret);
+        let mut anchor = clamp_boundary(&current, st0.anchor);
+        let mut dragging = st0.dragging;
+        let mut drag_start = clamp_boundary(&current, st0.drag_start);
+        let mut drag_moved = st0.drag_moved;
+        let mut pre_caret = clamp_boundary(&current, st0.pre_caret);
         let mut changed = false;
         let mut release_focus = false;
+
+        // Text-relative x → byte offset (8 px left pad).
+        let pad_l = 8.0_f32;
 
         if focused {
             let keys: Vec<crate::ui::KbdKey> = ui.kbd_keys_frame.to_vec();
             let chars: Vec<char> = ui.kbd_chars_frame.to_vec();
             for k in &keys {
                 let key = KeyCode(k.key_code);
+                let shift = k.shift;
                 if key == KeyCode::ESCAPE {
                     release_focus = true;
                     break;
                 } else if key == KeyCode::BACKSPACE {
-                    if caret > 0 {
-                        let new_caret = prev_char_boundary(&current, caret);
-                        current.replace_range(new_caret..caret, "");
-                        caret = new_caret;
+                    if anchor != caret {
+                        let (s, e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(s..e, "");
+                        caret = s;
+                        anchor = s;
+                        changed = true;
+                    } else if caret > 0 {
+                        let nc = prev_char_boundary(&current, caret);
+                        current.replace_range(nc..caret, "");
+                        caret = nc;
+                        anchor = nc;
                         changed = true;
                     }
                 } else if key == KeyCode::DELETE {
-                    if caret < current.len() {
+                    if anchor != caret {
+                        let (s, e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(s..e, "");
+                        caret = s;
+                        anchor = s;
+                        changed = true;
+                    } else if caret < current.len() {
                         let next = next_char_boundary(&current, caret);
                         current.replace_range(caret..next, "");
                         changed = true;
                     }
                 } else if key == KeyCode::LEFT {
-                    caret = prev_char_boundary(&current, caret);
+                    if anchor != caret && !shift {
+                        // Collapse to the near edge.
+                        caret = anchor.min(caret);
+                    } else {
+                        caret = prev_char_boundary(&current, caret);
+                    }
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::RIGHT {
-                    caret = next_char_boundary(&current, caret);
+                    if anchor != caret && !shift {
+                        caret = anchor.max(caret);
+                    } else {
+                        caret = next_char_boundary(&current, caret);
+                    }
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::HOME {
                     caret = 0;
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::END {
                     caret = current.len();
+                    if !shift {
+                        anchor = caret;
+                    }
                 }
             }
             for ch in chars {
                 if !ch.is_control() {
                     let mut buf = [0u8; 4];
                     let s = ch.encode_utf8(&mut buf);
-                    current.insert_str(caret.min(current.len()), s);
-                    caret += s.len();
+                    if anchor != caret {
+                        let (sel_s, sel_e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(sel_s..sel_e, s);
+                        caret = sel_s + s.len();
+                    } else {
+                        current.insert_str(caret.min(current.len()), s);
+                        caret += s.len();
+                    }
+                    anchor = caret;
                     changed = true;
                 }
             }
         }
 
         caret = caret.min(current.len());
-        ui.storage
-            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
-            .caret = caret;
+        anchor = anchor.min(current.len());
 
         if release_focus {
             crate::ui::set_focused_region(None);
@@ -5748,14 +5823,72 @@ impl<'a, 'b> TextInputBuilder<'a, 'b> {
         let resp_clicked;
         let resp_hovered;
         let resp_rect;
-        let click_local: Option<Point>;
         {
-            let sense = if disabled { Sense::Hover } else { Sense::Click };
+            let sense = if disabled { Sense::Hover } else { Sense::Drag };
             let (mut p, r) = ui.allocate_painter_for_id((width, height), sense, widget_id);
             resp_clicked = r.clicked;
             resp_hovered = r.hovered;
             resp_rect = r.rect;
-            click_local = if r.clicked { r.pointer_local } else { None };
+
+            // ── pointer-driven caret + drag selection ────────────
+            // The widget sees only the per-frame `pressed` level, so
+            // down / up edges are recovered by diffing against the
+            // stored `dragging` flag.
+            if !disabled {
+                // Keep `pre_caret` fresh between interactions so a
+                // shift+click whose down-edge wasn't observed (stuck
+                // drag after an off-widget release) still extends from
+                // a sane caret rather than a stale offset.
+                if !dragging {
+                    pre_caret = caret;
+                }
+                let to_pos = |lx: f32| caret_from_click_x(&current, &style, lx - pad_l);
+                if r.pressed && !dragging {
+                    // DOWN edge.
+                    crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+                    dragging = true;
+                    drag_moved = false;
+                    pre_caret = caret;
+                    if let Some(l) = r.pointer_local {
+                        drag_start = to_pos(l.x);
+                    } else {
+                        // No pointer this frame — anchor the press at
+                        // the current caret rather than a stale offset.
+                        drag_start = caret;
+                    }
+                    caret = drag_start;
+                    anchor = drag_start;
+                } else if r.pressed && dragging {
+                    // MOVE while held → live selection from drag_start.
+                    if let Some(l) = r.pointer_local {
+                        let p2 = to_pos(l.x);
+                        if p2 != drag_start {
+                            drag_moved = true;
+                        }
+                        if drag_moved {
+                            anchor = drag_start;
+                            caret = p2;
+                        }
+                    }
+                } else if !r.pressed && dragging {
+                    // UP edge.
+                    dragging = false;
+                }
+                // A click (press+release without a drag): shift
+                // extends from the pre-press caret; plain places.
+                if r.clicked && !drag_moved {
+                    if let Some(l) = r.pointer_local {
+                        let p2 = to_pos(l.x);
+                        if r.click_shift {
+                            anchor = pre_caret;
+                            caret = p2;
+                        } else {
+                            caret = p2;
+                            anchor = p2;
+                        }
+                    }
+                }
+            }
 
             if let Some(tok) = shadow_token {
                 if !disabled {
@@ -5789,8 +5922,22 @@ impl<'a, 'b> TextInputBuilder<'a, 'b> {
             };
             let mut ts = text_style(&style, text_color);
             ts.baseline = TextBaseline::Middle;
-            let text_x = p.rect().x() + 8.0;
+            let text_x = p.rect().x() + pad_l;
             let text_y = p.rect().y() + height * 0.5;
+
+            // Selection highlight — drawn before the glyphs.
+            caret = caret.min(current.len());
+            anchor = anchor.min(current.len());
+            if focused && anchor != caret {
+                let (s, e) = (anchor.min(caret), anchor.max(caret));
+                let hx0 = text_x + text_width(&current[..s], &style);
+                let hx1 = text_x + text_width(&current[..e], &style);
+                p.fill_rect(
+                    Rect::new(hx0, p.rect().y() + 3.0, (hx1 - hx0).max(1.0), height - 6.0),
+                    CornerRadius::uniform(2.0),
+                    Brush::Solid(style.accent.with_alpha(0.30)),
+                );
+            }
 
             // Placeholder when empty + not focused; same call shape
             // as the actual text path so the renderer doesn't
@@ -5822,17 +5969,22 @@ impl<'a, 'b> TextInputBuilder<'a, 'b> {
             }
         }
 
-        if !disabled && resp_clicked {
-            crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
-            if let Some(local) = click_local {
-                let click_x_in_text = local.x - 8.0;
-                let new_caret = caret_from_click_x(&current, &style, click_x_in_text);
-                ui.storage
-                    .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
-                    .caret = new_caret;
-            }
+        // Persist the full selection + drag state.
+        caret = caret.min(current.len());
+        anchor = anchor.min(current.len());
+        {
+            let st = ui
+                .storage
+                .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default);
+            st.caret = caret;
+            st.anchor = anchor;
+            st.dragging = dragging;
+            st.drag_start = drag_start.min(current.len());
+            st.drag_moved = drag_moved;
+            st.pre_caret = pre_caret.min(current.len());
         }
-        if focused {
+
+        if focused || dragging {
             ui.request_animation();
         }
         if changed {
@@ -6002,11 +6154,16 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
         let focused = !disabled && ui.is_focused(widget_id);
 
         let mut current = value.get();
-        let mut caret = ui
+        let st0 = *ui
             .storage
-            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
-            .caret
-            .min(current.len());
+            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default);
+        let mut caret = clamp_boundary(&current, st0.caret);
+        let mut anchor = clamp_boundary(&current, st0.anchor);
+        let mut dragging = st0.dragging;
+        let mut drag_start = clamp_boundary(&current, st0.drag_start);
+        let mut drag_moved = st0.drag_moved;
+        let mut pre_caret = clamp_boundary(&current, st0.pre_caret);
+        let mut goal_col_x = st0.goal_col_x;
         let mut changed = false;
         let mut release_focus = false;
 
@@ -6015,44 +6172,88 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
             let chars: Vec<char> = ui.kbd_chars_frame.to_vec();
             for k in &keys {
                 let key = KeyCode(k.key_code);
+                let shift = k.shift;
+                // Most keys reset the goal column; Up/Down preserve it.
+                let mut keep_goal = false;
                 if key == KeyCode::ESCAPE {
                     release_focus = true;
                     break;
                 } else if key == KeyCode::ENTER {
-                    current.insert(caret.min(current.len()), '\n');
-                    caret += 1;
+                    if anchor != caret {
+                        let (s, e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(s..e, "\n");
+                        caret = s + 1;
+                    } else {
+                        current.insert(caret.min(current.len()), '\n');
+                        caret += 1;
+                    }
+                    anchor = caret;
                     changed = true;
                 } else if key == KeyCode::BACKSPACE {
-                    if caret > 0 {
+                    if anchor != caret {
+                        let (s, e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(s..e, "");
+                        caret = s;
+                    } else if caret > 0 {
                         let nc = prev_char_boundary(&current, caret);
                         current.replace_range(nc..caret, "");
                         caret = nc;
-                        changed = true;
                     }
+                    anchor = caret;
+                    changed = true;
                 } else if key == KeyCode::DELETE {
-                    if caret < current.len() {
+                    if anchor != caret {
+                        let (s, e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(s..e, "");
+                        caret = s;
+                        anchor = s;
+                        changed = true;
+                    } else if caret < current.len() {
                         let next = next_char_boundary(&current, caret);
                         current.replace_range(caret..next, "");
                         changed = true;
                     }
                 } else if key == KeyCode::LEFT {
-                    caret = prev_char_boundary(&current, caret);
+                    if anchor != caret && !shift {
+                        caret = anchor.min(caret);
+                    } else {
+                        caret = prev_char_boundary(&current, caret);
+                    }
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::RIGHT {
-                    caret = next_char_boundary(&current, caret);
+                    if anchor != caret && !shift {
+                        caret = anchor.max(caret);
+                    } else {
+                        caret = next_char_boundary(&current, caret);
+                    }
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::HOME {
                     let starts = line_starts(&current);
                     caret = caret_row(&starts, caret).1;
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::END {
                     let starts = line_starts(&current);
                     let (row, _) = caret_row(&starts, caret);
                     caret = line_end(&current, &starts, row);
+                    if !shift {
+                        anchor = caret;
+                    }
                 } else if key == KeyCode::UP || key == KeyCode::DOWN {
-                    // Preserve horizontal position across the line
-                    // jump: measure the caret's x within its line,
-                    // then map that x onto the target line.
+                    // Preserve horizontal position across line jumps.
+                    // `goal_col_x` is sticky so repeated Up/Down keep
+                    // the original column even over short lines.
                     let starts = line_starts(&current);
                     let (row, line_start) = caret_row(&starts, caret);
-                    let col_x = text_width(&current[line_start..caret], &style);
+                    let here_x = text_width(&current[line_start..caret], &style);
+                    let col_x = if goal_col_x > 0.0 { goal_col_x } else { here_x };
+                    goal_col_x = col_x;
+                    keep_goal = true;
                     let target = if key == KeyCode::UP {
                         row.saturating_sub(1)
                     } else {
@@ -6064,23 +6265,35 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                         let t_line = &current[t_start..t_end];
                         caret = t_start + caret_from_click_x(t_line, &style, col_x);
                     }
+                    if !shift {
+                        anchor = caret;
+                    }
+                }
+                if !keep_goal {
+                    goal_col_x = 0.0;
                 }
             }
             for ch in chars {
                 if !ch.is_control() {
                     let mut buf = [0u8; 4];
                     let s = ch.encode_utf8(&mut buf);
-                    current.insert_str(caret.min(current.len()), s);
-                    caret += s.len();
+                    if anchor != caret {
+                        let (sel_s, sel_e) = (anchor.min(caret), anchor.max(caret));
+                        current.replace_range(sel_s..sel_e, s);
+                        caret = sel_s + s.len();
+                    } else {
+                        current.insert_str(caret.min(current.len()), s);
+                        caret += s.len();
+                    }
+                    anchor = caret;
+                    goal_col_x = 0.0;
                     changed = true;
                 }
             }
         }
 
         caret = caret.min(current.len());
-        ui.storage
-            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
-            .caret = caret;
+        anchor = anchor.min(current.len());
         if release_focus {
             crate::ui::set_focused_region(None);
         }
@@ -6099,14 +6312,71 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
         let resp_clicked;
         let resp_hovered;
         let resp_rect;
-        let click_local: Option<Point>;
         {
-            let sense = if disabled { Sense::Hover } else { Sense::Click };
+            let sense = if disabled { Sense::Hover } else { Sense::Drag };
             let (mut p, r) = ui.allocate_painter_for_id((width, height), sense, widget_id);
             resp_clicked = r.clicked;
             resp_hovered = r.hovered;
             resp_rect = r.rect;
-            click_local = if r.clicked { r.pointer_local } else { None };
+
+            // 2D click (x, y) → byte offset: row from y (within the
+            // visible window), column from x in that row's text.
+            let to_pos = |local: Point| -> usize {
+                let rel_row = ((local.y - pad_v) / line_h).floor().max(0.0) as usize;
+                let row = (first_visible + rel_row).min(total_lines.saturating_sub(1));
+                let ls = starts[row];
+                let le = line_end(&current, &starts, row);
+                let line = &current[ls..le];
+                ls + caret_from_click_x(line, &style, local.x - pad_h)
+            };
+
+            if !disabled {
+                if !dragging {
+                    pre_caret = caret;
+                }
+                if r.pressed && !dragging {
+                    crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+                    dragging = true;
+                    drag_moved = false;
+                    pre_caret = caret;
+                    if let Some(l) = r.pointer_local {
+                        drag_start = to_pos(l);
+                    } else {
+                        drag_start = caret;
+                    }
+                    caret = drag_start;
+                    anchor = drag_start;
+                    goal_col_x = 0.0;
+                } else if r.pressed && dragging {
+                    if let Some(l) = r.pointer_local {
+                        let p2 = to_pos(l);
+                        if p2 != drag_start {
+                            drag_moved = true;
+                        }
+                        if drag_moved {
+                            anchor = drag_start;
+                            caret = p2;
+                        }
+                    }
+                } else if !r.pressed && dragging {
+                    dragging = false;
+                }
+                if r.clicked && !drag_moved {
+                    if let Some(l) = r.pointer_local {
+                        let p2 = to_pos(l);
+                        if r.click_shift {
+                            anchor = pre_caret;
+                            caret = p2;
+                        } else {
+                            caret = p2;
+                            anchor = p2;
+                        }
+                        // Clicking sets a fresh column for the next
+                        // vertical move; clear the sticky goal.
+                        goal_col_x = 0.0;
+                    }
+                }
+            }
 
             if let Some(tok) = shadow_token {
                 if !disabled {
@@ -6143,6 +6413,12 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
             let text_x = p.rect().x() + pad_h;
             let top = p.rect().y() + pad_v;
 
+            // Per-line selection highlight (drawn before glyphs).
+            caret = caret.min(current.len());
+            anchor = anchor.min(current.len());
+            let (sel_s, sel_e) = (anchor.min(caret), anchor.max(caret));
+            let sel_active = focused && sel_s != sel_e;
+
             if current.is_empty() && !focused {
                 if let Some(ph) = &placeholder {
                     let mut pts = ts.clone();
@@ -6150,7 +6426,6 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                     p.draw_text(ph, &pts, Point::new(text_x, top + line_h * 0.5));
                 }
             } else {
-                // Draw the visible window of lines.
                 for vis in 0..rows {
                     let row = first_visible + vis;
                     if row >= total_lines {
@@ -6158,10 +6433,24 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
                     }
                     let ls = starts[row];
                     let le = line_end(&current, &starts, row);
+                    let ly = top + vis as f32 * line_h;
+                    // Highlight this row's slice of the selection.
+                    if sel_active {
+                        let rs = sel_s.max(ls);
+                        let re = sel_e.min(le);
+                        if rs < re {
+                            let hx0 = text_x + text_width(&current[ls..rs], &style);
+                            let hx1 = text_x + text_width(&current[ls..re], &style);
+                            p.fill_rect(
+                                Rect::new(hx0, ly, (hx1 - hx0).max(1.0), line_h),
+                                CornerRadius::uniform(2.0),
+                                Brush::Solid(style.accent.with_alpha(0.30)),
+                            );
+                        }
+                    }
                     let line = &current[ls..le];
                     if !line.is_empty() {
-                        let ly = top + vis as f32 * line_h + line_h * 0.5;
-                        p.draw_text(line, &ts, Point::new(text_x, ly));
+                        p.draw_text(line, &ts, Point::new(text_x, ly + line_h * 0.5));
                     }
                 }
             }
@@ -6182,22 +6471,22 @@ impl<'a, 'b> TextareaBuilder<'a, 'b> {
             }
         }
 
-        if !disabled && resp_clicked {
-            crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
-            if let Some(local) = click_local {
-                // Map click (x, y) → row → byte offset in that line.
-                let rel_row = ((local.y - pad_v) / line_h).floor().max(0.0) as usize;
-                let row = (first_visible + rel_row).min(total_lines.saturating_sub(1));
-                let ls = starts[row];
-                let le = line_end(&current, &starts, row);
-                let line = &current[ls..le];
-                let new_caret = ls + caret_from_click_x(line, &style, local.x - pad_h);
-                ui.storage
-                    .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
-                    .caret = new_caret.min(current.len());
-            }
+        caret = caret.min(current.len());
+        anchor = anchor.min(current.len());
+        {
+            let st = ui
+                .storage
+                .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default);
+            st.caret = caret;
+            st.anchor = anchor;
+            st.dragging = dragging;
+            st.drag_start = drag_start.min(current.len());
+            st.drag_moved = drag_moved;
+            st.pre_caret = pre_caret.min(current.len());
+            st.goal_col_x = goal_col_x;
         }
-        if focused {
+
+        if focused || dragging {
             ui.request_animation();
         }
         if changed {
@@ -6241,6 +6530,23 @@ fn caret_from_click_x(value: &str, style: &PortalStyle, click_x: f32) -> usize {
         last_width = width;
     }
     value.len()
+}
+
+/// Clamp a stored byte offset to a valid char boundary of `s`.
+/// Caret / anchor offsets persist across frames in `PortalStorage`,
+/// but the bound `String` can be mutated externally between frames
+/// (another widget / FSM writing the same signal). A plain
+/// `.min(len)` keeps the offset in range but can still land
+/// mid-codepoint after such an edit, which panics the moment it's
+/// used as a slice index. This snaps to the nearest boundary at or
+/// below the offset.
+fn clamp_boundary(s: &str, offset: usize) -> usize {
+    let o = offset.min(s.len());
+    if s.is_char_boundary(o) {
+        o
+    } else {
+        prev_char_boundary(s, o)
+    }
 }
 
 /// UTF-8 safe step back from a byte offset to the previous char

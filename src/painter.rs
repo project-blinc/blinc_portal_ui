@@ -276,6 +276,7 @@ pub fn build_response(
     region_clicked_this_frame: bool,
     pointer_content: Option<Point>,
     drag_delta_content: Point,
+    click_shift: bool,
 ) -> Response {
     let pointer_local = pointer_content
         .filter(|_| region_hovered || region_active)
@@ -294,5 +295,6 @@ pub fn build_response(
         // directly get the default.
         widget_id: Default::default(),
         pip_clicked: false,
+        click_shift,
     }
 }
