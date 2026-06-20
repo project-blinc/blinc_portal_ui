@@ -47,8 +47,8 @@ pub use crate::ui::{
 };
 pub use crate::widget::{
     paint_chart, paint_pie, paint_radar, ButtonBuilder, ChartDecimation, ChartPaint, ChartVariant,
-    ChartsBuilder, ColorPickerBuilder, NoiseBuilder, NoiseVariant, NumericInputBuilder,
-    PieChartBuilder, PiePaint, RadarChartBuilder, RadarPaint, SdfShape, SdfShapeBuilder,
-    SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder, TextureBuilder, TextureFit,
-    TextureSource, WaveGraphBuilder, WaveStyle,
+    ChartsBuilder, ColorPickerBuilder, FilePickerBuilder, NoiseBuilder, NoiseVariant,
+    NumericInputBuilder, PieChartBuilder, PiePaint, RadarChartBuilder, RadarPaint, SdfShape,
+    SdfShapeBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder,
+    TextareaBuilder, TextureBuilder, TextureFit, TextureSource, WaveGraphBuilder, WaveStyle,
 };

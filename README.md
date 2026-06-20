@@ -64,7 +64,8 @@ Two layers:
 
 Built-in widget catalog: `label`, `label_signal`, `button` (+ six
 variants), `switch`, `slider`, `numeric_input`, `text_input`,
-`color_picker`, `select_trigger` / `select` / `select_signal`,
+`textarea`, `file_picker`, `color_picker`,
+`select_trigger` / `select` / `select_signal`,
 `chart` (line / bar / area), `pie_chart`, `radar_chart`,
 `wave_graph` (oscilloscope / audio waveform), `noise` (Perlin /
 Worley / Voronoi), `texture` (ImageId + inline RGBA),

@@ -5878,6 +5878,343 @@ impl<'a> PortalUi<'a> {
     pub fn text_input_signal(&mut self, sig: &Signal<String>) -> Response {
         self.text_input(sig).show()
     }
+
+    /// Editable multi-line text area. Like [`Self::text_input`] but
+    /// wraps onto `rows` visual lines, Enter inserts a newline (it
+    /// does not blur), and Up / Down move the caret between lines
+    /// preserving the horizontal position. Accepts `&mut String` or
+    /// `&Signal<String>`. Chain `.rows(n)` / `.placeholder(...)` /
+    /// `.disabled(...)` / `.width(...)` / `.shadow_*()`, then
+    /// `.show()` / `.changed()`.
+    pub fn textarea<'b, V: PortalValue<'b, String>>(
+        &'b mut self,
+        value: V,
+    ) -> TextareaBuilder<'a, 'b> {
+        TextareaBuilder {
+            ui: self,
+            value: value.into_binding(),
+            disabled: false,
+            placeholder: None,
+            width_override: None,
+            rows: 4,
+            shadow_token: None,
+        }
+    }
+}
+
+// ── multi-line caret helpers ──────────────────────────────────────
+// Byte offsets of every line start (after each '\n'). Always begins
+// with 0; length == visible line count.
+fn line_starts(s: &str) -> Vec<usize> {
+    let mut v = vec![0usize];
+    for (i, ch) in s.char_indices() {
+        if ch == '\n' {
+            v.push(i + ch.len_utf8());
+        }
+    }
+    v
+}
+
+// End byte of line `row` (exclusive of the trailing '\n').
+fn line_end(s: &str, starts: &[usize], row: usize) -> usize {
+    if row + 1 < starts.len() {
+        // Char before the next line's start is the '\n'.
+        prev_char_boundary(s, starts[row + 1])
+    } else {
+        s.len()
+    }
+}
+
+// (row, line_start_byte) for a caret byte offset.
+fn caret_row(starts: &[usize], caret: usize) -> (usize, usize) {
+    let mut row = 0;
+    for (i, &st) in starts.iter().enumerate() {
+        if st <= caret {
+            row = i;
+        } else {
+            break;
+        }
+    }
+    (row, starts[row])
+}
+
+#[must_use = "TextareaBuilder is lazy — call .show() / .changed() to paint"]
+pub struct TextareaBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, String>,
+    disabled: bool,
+    placeholder: Option<String>,
+    width_override: Option<f32>,
+    rows: usize,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for TextareaBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> TextareaBuilder<'a, 'b> {
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn placeholder(mut self, t: impl Into<String>) -> Self {
+        self.placeholder = Some(t.into());
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    /// Visible line count (the box height). Default 4. Text beyond
+    /// `rows` lines still edits but scrolls out of view at the
+    /// bottom (the caret line is kept in view).
+    pub fn rows(mut self, n: usize) -> Self {
+        self.rows = n.max(1);
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::events::KeyCode;
+
+        let TextareaBuilder {
+            ui,
+            mut value,
+            disabled,
+            placeholder,
+            width_override,
+            rows,
+            shadow_token,
+        } = self;
+        let style = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(80.0, 320.0));
+        let pad_h = 8.0_f32;
+        let pad_v = 6.0_f32;
+        let line_h = style.line_height;
+        let height = rows as f32 * line_h + 2.0 * pad_v;
+
+        let widget_id = ui.make_widget_id(None);
+        let portal_id = ui.portal_id;
+        let focused = !disabled && ui.is_focused(widget_id);
+
+        let mut current = value.get();
+        let mut caret = ui
+            .storage
+            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
+            .caret
+            .min(current.len());
+        let mut changed = false;
+        let mut release_focus = false;
+
+        if focused {
+            let keys: Vec<crate::ui::KbdKey> = ui.kbd_keys_frame.to_vec();
+            let chars: Vec<char> = ui.kbd_chars_frame.to_vec();
+            for k in &keys {
+                let key = KeyCode(k.key_code);
+                if key == KeyCode::ESCAPE {
+                    release_focus = true;
+                    break;
+                } else if key == KeyCode::ENTER {
+                    current.insert(caret.min(current.len()), '\n');
+                    caret += 1;
+                    changed = true;
+                } else if key == KeyCode::BACKSPACE {
+                    if caret > 0 {
+                        let nc = prev_char_boundary(&current, caret);
+                        current.replace_range(nc..caret, "");
+                        caret = nc;
+                        changed = true;
+                    }
+                } else if key == KeyCode::DELETE {
+                    if caret < current.len() {
+                        let next = next_char_boundary(&current, caret);
+                        current.replace_range(caret..next, "");
+                        changed = true;
+                    }
+                } else if key == KeyCode::LEFT {
+                    caret = prev_char_boundary(&current, caret);
+                } else if key == KeyCode::RIGHT {
+                    caret = next_char_boundary(&current, caret);
+                } else if key == KeyCode::HOME {
+                    let starts = line_starts(&current);
+                    caret = caret_row(&starts, caret).1;
+                } else if key == KeyCode::END {
+                    let starts = line_starts(&current);
+                    let (row, _) = caret_row(&starts, caret);
+                    caret = line_end(&current, &starts, row);
+                } else if key == KeyCode::UP || key == KeyCode::DOWN {
+                    // Preserve horizontal position across the line
+                    // jump: measure the caret's x within its line,
+                    // then map that x onto the target line.
+                    let starts = line_starts(&current);
+                    let (row, line_start) = caret_row(&starts, caret);
+                    let col_x = text_width(&current[line_start..caret], &style);
+                    let target = if key == KeyCode::UP {
+                        row.saturating_sub(1)
+                    } else {
+                        (row + 1).min(starts.len() - 1)
+                    };
+                    if target != row {
+                        let t_start = starts[target];
+                        let t_end = line_end(&current, &starts, target);
+                        let t_line = &current[t_start..t_end];
+                        caret = t_start + caret_from_click_x(t_line, &style, col_x);
+                    }
+                }
+            }
+            for ch in chars {
+                if !ch.is_control() {
+                    let mut buf = [0u8; 4];
+                    let s = ch.encode_utf8(&mut buf);
+                    current.insert_str(caret.min(current.len()), s);
+                    caret += s.len();
+                    changed = true;
+                }
+            }
+        }
+
+        caret = caret.min(current.len());
+        ui.storage
+            .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
+            .caret = caret;
+        if release_focus {
+            crate::ui::set_focused_region(None);
+        }
+
+        // Caret row drives vertical scroll so the caret line stays
+        // visible when the content exceeds `rows`.
+        let starts = line_starts(&current);
+        let total_lines = starts.len();
+        let (caret_line, _) = caret_row(&starts, caret);
+        let first_visible = if caret_line >= rows {
+            caret_line + 1 - rows
+        } else {
+            0
+        };
+
+        let resp_clicked;
+        let resp_hovered;
+        let resp_rect;
+        let click_local: Option<Point>;
+        {
+            let sense = if disabled { Sense::Hover } else { Sense::Click };
+            let (mut p, r) = ui.allocate_painter_for_id((width, height), sense, widget_id);
+            resp_clicked = r.clicked;
+            resp_hovered = r.hovered;
+            resp_rect = r.rect;
+            click_local = if r.clicked { r.pointer_local } else { None };
+
+            if let Some(tok) = shadow_token {
+                if !disabled {
+                    let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                    let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                        .get(tok)
+                        .iter()
+                        .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                        .collect();
+                    p.shadow_self(&style, &stack);
+                }
+            }
+
+            let bg = if disabled {
+                style.field_bg.with_alpha(0.5)
+            } else {
+                style.field_bg
+            };
+            let border = if focused || r.hovered {
+                style.field_border_focus
+            } else {
+                style.field_border
+            };
+            p.fill_self(&style, Brush::Solid(bg));
+            p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
+
+            let text_color = if disabled {
+                style.text_disabled
+            } else {
+                style.text_primary
+            };
+            let mut ts = text_style(&style, text_color);
+            ts.baseline = TextBaseline::Middle;
+            let text_x = p.rect().x() + pad_h;
+            let top = p.rect().y() + pad_v;
+
+            if current.is_empty() && !focused {
+                if let Some(ph) = &placeholder {
+                    let mut pts = ts.clone();
+                    pts.color = style.text_disabled;
+                    p.draw_text(ph, &pts, Point::new(text_x, top + line_h * 0.5));
+                }
+            } else {
+                // Draw the visible window of lines.
+                for vis in 0..rows {
+                    let row = first_visible + vis;
+                    if row >= total_lines {
+                        break;
+                    }
+                    let ls = starts[row];
+                    let le = line_end(&current, &starts, row);
+                    let line = &current[ls..le];
+                    if !line.is_empty() {
+                        let ly = top + vis as f32 * line_h + line_h * 0.5;
+                        p.draw_text(line, &ts, Point::new(text_x, ly));
+                    }
+                }
+            }
+
+            if focused && caret_line >= first_visible && caret_line < first_visible + rows {
+                let ls = starts[caret_line];
+                let caret_x = text_x + text_width(&current[ls..caret], &style);
+                let row_top = top + (caret_line - first_visible) as f32 * line_h + 2.0;
+                let row_bot = row_top + line_h - 4.0;
+                let caret_path = blinc_core::draw::Path::new()
+                    .move_to(caret_x, row_top)
+                    .line_to(caret_x, row_bot);
+                p.stroke_path(
+                    &caret_path,
+                    &Stroke::new(1.0),
+                    Brush::Solid(style.text_primary),
+                );
+            }
+        }
+
+        if !disabled && resp_clicked {
+            crate::ui::set_focused_region(Some(widget_id.to_region_id(portal_id)));
+            if let Some(local) = click_local {
+                // Map click (x, y) → row → byte offset in that line.
+                let rel_row = ((local.y - pad_v) / line_h).floor().max(0.0) as usize;
+                let row = (first_visible + rel_row).min(total_lines.saturating_sub(1));
+                let ls = starts[row];
+                let le = line_end(&current, &starts, row);
+                let line = &current[ls..le];
+                let new_caret = ls + caret_from_click_x(line, &style, local.x - pad_h);
+                ui.storage
+                    .get_or_insert_with::<TextInputState, _>(widget_id, TextInputState::default)
+                    .caret = new_caret.min(current.len());
+            }
+        }
+        if focused {
+            ui.request_animation();
+        }
+        if changed {
+            value.set(current);
+        }
+
+        let mut resp = Response::empty();
+        resp.rect = resp_rect;
+        resp.hovered = resp_hovered;
+        resp.clicked = resp_clicked;
+        resp.changed = changed;
+        resp.widget_id = widget_id;
+        resp
+    }
+    pub fn changed(self) -> bool {
+        self.show().changed
+    }
 }
 
 /// Walk `value` char-by-char and return the byte offset where a
@@ -6090,6 +6427,181 @@ impl<'a> PortalUi<'a> {
             value: value.into_binding(),
             width_override: None,
             disabled: false,
+            shadow_token: None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// file_picker — trigger chip bound to a path `String`. Paints a
+// folder glyph + the file's base name (or a placeholder). Same
+// overlay-escape contract as color_picker / select_trigger: the
+// widget only signals intent via `Response.clicked`; the host opens
+// the actual file dialog (native or an overlay browser) and writes
+// the chosen path back into the bound value.
+// ─────────────────────────────────────────────────────────────────────
+
+#[must_use = "FilePickerBuilder is lazy — call .show() / .clicked() to paint"]
+pub struct FilePickerBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, String>,
+    width_override: Option<f32>,
+    disabled: bool,
+    placeholder: Option<String>,
+    shadow_token: Option<ShadowToken>,
+}
+
+impl<'a, 'b> ShadowMix for FilePickerBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> FilePickerBuilder<'a, 'b> {
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    /// Text shown when the bound path is empty. Default
+    /// "Choose file…".
+    pub fn placeholder(mut self, t: impl Into<String>) -> Self {
+        self.placeholder = Some(t.into());
+        self
+    }
+
+    pub fn show(self) -> Response {
+        let FilePickerBuilder {
+            ui,
+            value,
+            width_override,
+            disabled,
+            placeholder,
+            shadow_token,
+        } = self;
+        let style = ui.style.clone();
+        let height = style.control_height;
+        let path = value.get();
+        // Show the base name (last path segment) — the full path is
+        // usually too long for an inline chip. Cross-platform split
+        // on both separators.
+        let base = path
+            .rsplit(|c| c == '/' || c == '\\')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let ph = placeholder.unwrap_or_else(|| "Choose file…".to_string());
+        let label = base.clone().unwrap_or_else(|| ph.clone());
+
+        let icon_size = (height - 8.0).max(12.0);
+        let label_w = text_width(&label, &style).max(text_width("Choose file…", &style));
+        let default_w = icon_size + 4.0 + label_w + 12.0;
+        let width = width_override.unwrap_or(default_w);
+
+        let sense = if disabled { Sense::Hover } else { Sense::Click };
+        let (mut p, resp) = ui.allocate_painter((width, height), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&style, &stack);
+            }
+        }
+
+        let bg = if disabled {
+            style.field_bg.with_alpha(0.5)
+        } else if resp.pressed {
+            style.button_pressed
+        } else if resp.hovered {
+            style.button_hover
+        } else {
+            style.field_bg
+        };
+        let border = if resp.hovered && !disabled {
+            style.field_border_focus
+        } else {
+            style.field_border
+        };
+        p.fill_self(&style, Brush::Solid(bg));
+        p.stroke_self(&style, &Stroke::new(1.0), Brush::Solid(border));
+
+        // Folder glyph — a simple two-rect "folder" (tab + body)
+        // drawn from primitives so the widget needs no icon font.
+        let gx = p.rect().x() + 4.0;
+        let gy = p.rect().y() + (height - icon_size) * 0.5;
+        let icon_color = if disabled {
+            style.text_disabled
+        } else {
+            style.text_secondary
+        };
+        let body_top = gy + icon_size * 0.32;
+        p.fill_rect(
+            Rect::new(gx, body_top, icon_size, icon_size * 0.55),
+            CornerRadius::uniform(2.0),
+            Brush::Solid(icon_color),
+        );
+        // Tab on the top-left of the folder.
+        p.fill_rect(
+            Rect::new(gx, gy + icon_size * 0.18, icon_size * 0.45, icon_size * 0.2),
+            CornerRadius::uniform(1.5),
+            Brush::Solid(icon_color),
+        );
+
+        // Label — base name in primary text, placeholder dimmed.
+        let label_color = if disabled {
+            style.text_disabled
+        } else if base.is_some() {
+            style.text_primary
+        } else {
+            style.text_disabled
+        };
+        let mut ts = text_style(&style, label_color);
+        ts.baseline = TextBaseline::Middle;
+        let label_x = gx + icon_size + 4.0;
+        let label_y = p.rect().y() + height * 0.5;
+        p.draw_text(&label, &ts, Point::new(label_x, label_y));
+
+        resp
+    }
+    pub fn clicked(self) -> bool {
+        self.show().clicked
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Paint a file-picker trigger chip bound to a path `String`.
+    /// Shows a folder glyph + the path's base name (or a
+    /// placeholder when empty). Returns a [`FilePickerBuilder`];
+    /// chain `.disabled(...)` / `.width(...)` / `.placeholder(...)` /
+    /// `.shadow_*()` and terminate with `.show()` (full Response) or
+    /// `.clicked()` (`bool`).
+    ///
+    /// Overlay-escape contract (same as [`Self::color_picker`] /
+    /// [`Self::select_trigger`]): when `resp.clicked` is true the
+    /// host opens its file dialog — a native picker, or an overlay
+    /// browser anchored against `resp.rect` via
+    /// [`crate::core::HostBridge::rect_to_screen`] — and writes the
+    /// chosen path back into the bound value. The widget never
+    /// touches the filesystem or the overlay manager itself.
+    pub fn file_picker<'b, V: PortalValue<'b, String>>(
+        &'b mut self,
+        value: V,
+    ) -> FilePickerBuilder<'a, 'b> {
+        FilePickerBuilder {
+            ui: self,
+            value: value.into_binding(),
+            width_override: None,
+            disabled: false,
+            placeholder: None,
             shadow_token: None,
         }
     }

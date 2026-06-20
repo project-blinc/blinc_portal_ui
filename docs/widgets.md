@@ -97,6 +97,37 @@ let label = ctx.use_state(|| String::new());
 ui.text_input(&label).placeholder("Label…").show();
 ```
 
+## textarea
+
+Multi-line text editor bound to `String`. Like `text_input` but
+Enter inserts a newline (doesn't blur), Up/Down move the caret
+between lines preserving the horizontal position, and Home/End act
+on the current line. `.rows(n)` sets the visible height (default 4);
+content beyond `rows` scrolls with the caret. Same `install_kbd_hook`
+requirement as `text_input`.
+
+```rust
+let notes = ctx.use_state(|| String::new());
+ui.textarea(&notes).rows(6).placeholder("Notes…").show();
+```
+
+## file_picker
+
+Trigger chip bound to a path `String` — shows a folder glyph + the
+path's base name (or a placeholder). Like `color_picker` /
+`select`, the widget only signals intent; the host opens the file
+dialog (native or an overlay browser) on `resp.clicked` and writes
+the chosen path back.
+
+```rust
+let path = ctx.use_state(|| String::new());
+let resp = ui.file_picker(&path).placeholder("Choose model…").show();
+if resp.clicked {
+    let anchor = ui.host().rect_to_screen(resp.rect);
+    open_file_dialog(anchor, path.clone()); // host-owned
+}
+```
+
 ## color_picker
 
 Trigger chip for a colour value (RGBA hex string e.g. `"#ff8800ff"`).
