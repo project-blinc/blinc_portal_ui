@@ -65,8 +65,9 @@ Two layers:
 Built-in widget catalog: `label`, `label_signal`, `button` (+ six
 variants), `switch`, `slider`, `numeric_input`, `text_input`,
 `color_picker`, `select_trigger` / `select` / `select_signal`,
-`chart` (line / bar / area), `pie_chart`, `radar_chart`, `noise`
-(Perlin / Worley / Voronoi), `texture` (ImageId + inline RGBA),
+`chart` (line / bar / area), `pie_chart`, `radar_chart`,
+`wave_graph` (oscilloscope / audio waveform), `noise` (Perlin /
+Worley / Voronoi), `texture` (ImageId + inline RGBA),
 `sdf_shape` (2D + 3D, eight variants). Layout primitives:
 `horizontal`, `spacing`, `push_id`, `allocate_painter`,
 `request_animation`. Custom widgets are one-liners over

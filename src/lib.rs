@@ -49,5 +49,5 @@ pub use crate::widget::{
     ButtonBuilder, ChartDecimation, ChartVariant, ChartsBuilder, ColorPickerBuilder, NoiseBuilder,
     NoiseVariant, NumericInputBuilder, PieChartBuilder, RadarChartBuilder, SdfShape,
     SdfShapeBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder, TextureBuilder,
-    TextureFit, TextureSource,
+    TextureFit, TextureSource, WaveGraphBuilder, WaveStyle,
 };

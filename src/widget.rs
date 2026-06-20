@@ -2327,10 +2327,546 @@ impl<'a> PortalUi<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// noise — procedural 2D pattern visualiser. Hash-based Perlin /
-// Worley / Voronoi all reduced to a Vec<u8> RGBA buffer uploaded
-// via `draw_rgba_pixels`. Useful for game-tooling shaders, audio
-// noise floors, terrain previews.
+// wave_graph — oscilloscope-style signed-amplitude visualiser.
+// Same `Vec<f32>` input shape as the chart family, but centered on
+// zero with optional horizontal grid divisions and a centerline.
+// Useful for audio waveforms, LFO traces, signed control signals.
+// Square aspect like the other display portals.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Render style for [`WaveGraphBuilder`]. All variants centre the
+/// signal on the rect's vertical mid-line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WaveStyle {
+    /// Plain stroke through the samples. Default.
+    #[default]
+    Stroke,
+    /// Stroke + filled area between the wave and the zero line.
+    /// Negative samples fill downward, positive upward.
+    Filled,
+    /// Stroke + symmetric mirror — the wave's absolute value is
+    /// drawn above the zero line and reflected below. Classic
+    /// audio-editor look. Ignores the sign of the samples.
+    Mirrored,
+}
+
+#[must_use = "WaveGraphBuilder is lazy — call .show() / .changed() to paint"]
+pub struct WaveGraphBuilder<'a, 'b> {
+    ui: &'b mut PortalUi<'a>,
+    value: ValueBinding<'b, Vec<f32>>,
+    style: WaveStyle,
+    width_override: Option<f32>,
+    height_override: Option<f32>,
+    /// Y range expressed as `(min, max)`. Default `(-1.0, 1.0)` —
+    /// the natural audio-sample envelope. Use the actual signed
+    /// envelope (e.g. `-10..10` for a control voltage) so the
+    /// centerline lands at 0.
+    y_range: Option<std::ops::Range<f32>>,
+    line_width: f32,
+    /// Number of horizontal grid divisions per half. `0` disables
+    /// the grid; the centerline still renders if
+    /// `show_centerline` is true. Default: `2` (i.e. 4 lines
+    /// total — quarters of the half-range).
+    grid_divisions: u32,
+    show_centerline: bool,
+    show_grid: bool,
+    stroke_color: Option<Color>,
+    fill_color: Option<Color>,
+    grid_color: Option<Color>,
+    centerline_color: Option<Color>,
+    background: Option<Color>,
+    disabled: bool,
+    shadow_token: Option<ShadowToken>,
+    /// Hover tooltip showing the signed amplitude at the cursor's
+    /// x. Default `true`; disable for passive sparklines.
+    tooltip: bool,
+    tooltip_precision: Option<u8>,
+    tooltip_unit: Option<String>,
+    /// Picture-in-picture corner icon — sets `Response::pip_clicked`
+    /// when clicked so the host can mount an expanded scope view.
+    pip: bool,
+}
+
+impl<'a, 'b> ShadowMix for WaveGraphBuilder<'a, 'b> {
+    fn shadow(mut self, token: ShadowToken) -> Self {
+        self.shadow_token = Some(token);
+        self
+    }
+}
+
+impl<'a, 'b> WaveGraphBuilder<'a, 'b> {
+    pub fn style(mut self, s: WaveStyle) -> Self {
+        self.style = s;
+        self
+    }
+    pub fn stroke(mut self) -> Self {
+        self.style = WaveStyle::Stroke;
+        self
+    }
+    pub fn filled(mut self) -> Self {
+        self.style = WaveStyle::Filled;
+        self
+    }
+    pub fn mirrored(mut self) -> Self {
+        self.style = WaveStyle::Mirrored;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.width_override = Some(w);
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.height_override = Some(h);
+        self
+    }
+    pub fn y_range(mut self, r: std::ops::Range<f32>) -> Self {
+        self.y_range = Some(r);
+        self
+    }
+    pub fn line_width(mut self, w: f32) -> Self {
+        self.line_width = w.max(0.5);
+        self
+    }
+    pub fn grid_divisions(mut self, n: u32) -> Self {
+        self.grid_divisions = n;
+        self
+    }
+    pub fn show_centerline(mut self, b: bool) -> Self {
+        self.show_centerline = b;
+        self
+    }
+    pub fn show_grid(mut self, b: bool) -> Self {
+        self.show_grid = b;
+        self
+    }
+    pub fn stroke_color(mut self, c: Color) -> Self {
+        self.stroke_color = Some(c);
+        self
+    }
+    pub fn fill_color(mut self, c: Color) -> Self {
+        self.fill_color = Some(c);
+        self
+    }
+    pub fn grid_color(mut self, c: Color) -> Self {
+        self.grid_color = Some(c);
+        self
+    }
+    pub fn centerline_color(mut self, c: Color) -> Self {
+        self.centerline_color = Some(c);
+        self
+    }
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    pub fn disabled(mut self, b: bool) -> Self {
+        self.disabled = b;
+        self
+    }
+    pub fn tooltip(mut self, b: bool) -> Self {
+        self.tooltip = b;
+        self
+    }
+    pub fn tooltip_precision(mut self, p: u8) -> Self {
+        self.tooltip_precision = Some(p);
+        self
+    }
+    pub fn tooltip_unit(mut self, u: impl Into<String>) -> Self {
+        self.tooltip_unit = Some(u.into());
+        self
+    }
+    pub fn pip(mut self, b: bool) -> Self {
+        self.pip = b;
+        self
+    }
+
+    pub fn show(self) -> Response {
+        use blinc_core::draw::{LineCap, LineJoin};
+        use blinc_core::layer::{CornerRadius, Rect};
+
+        let WaveGraphBuilder {
+            ui,
+            value,
+            style,
+            width_override,
+            height_override,
+            y_range,
+            line_width,
+            grid_divisions,
+            show_centerline,
+            show_grid,
+            stroke_color,
+            fill_color,
+            grid_color,
+            centerline_color,
+            background,
+            disabled,
+            shadow_token,
+            tooltip,
+            tooltip_precision,
+            tooltip_unit,
+            pip,
+        } = self;
+
+        let pstyle = ui.style.clone();
+        let (avail_w, _) = ui.available_size();
+        let width = width_override.unwrap_or_else(|| avail_w.clamp(120.0, 240.0));
+        // Square default — same convention as the chart family.
+        let height = height_override.unwrap_or(width);
+
+        let data: Vec<f32> = value.get();
+        let sense = if pip && !disabled {
+            Sense::Click
+        } else if tooltip && !disabled {
+            Sense::Hover
+        } else {
+            Sense::None
+        };
+        let pip_strip = if pip && !disabled { 24.0 } else { 0.0 };
+        let alloc_h = height + pip_strip;
+        let (mut p, mut resp) = ui.allocate_painter((width, alloc_h), sense);
+
+        if let Some(tok) = shadow_token {
+            if !disabled {
+                let theme_shadows = blinc_theme::ThemeState::get().shadows();
+                let stack: Vec<blinc_core::layer::Shadow> = theme_shadows
+                    .get(tok)
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect();
+                p.shadow_self(&pstyle, &stack);
+            }
+        }
+        if let Some(bg) = background {
+            let bg = if disabled { bg.with_alpha(0.5) } else { bg };
+            p.fill_self(&pstyle, Brush::Solid(bg));
+        }
+
+        // 4 px inset so strokes don't kiss the painter rect.
+        let pad = 4.0_f32;
+        let plot_x = p.rect().x() + pad;
+        let plot_y = p.rect().y() + pad + pip_strip;
+        let plot_w = (p.rect().width() - 2.0 * pad).max(0.0);
+        let plot_h = (p.rect().height() - 2.0 * pad - pip_strip).max(0.0);
+
+        // Resolve y range. Default to ±1 — the natural audio-sample
+        // envelope. Callers can override for control voltages,
+        // oscillator outputs scaled to ±10, etc.
+        let (y_min, y_max) = match &y_range {
+            Some(r) => (r.start, r.end),
+            None => (-1.0_f32, 1.0_f32),
+        };
+        let y_span = (y_max - y_min).max(1e-6);
+
+        let alpha = if disabled { 0.5 } else { 1.0 };
+        let stroke = stroke_color.unwrap_or(pstyle.accent).with_alpha(alpha);
+        let fill = fill_color
+            .unwrap_or_else(|| pstyle.accent.with_alpha(0.20))
+            .with_alpha(alpha * 0.6);
+        let grid = grid_color
+            .unwrap_or_else(|| pstyle.text_primary.with_alpha(0.10))
+            .with_alpha(alpha * 0.6);
+        let center = centerline_color
+            .unwrap_or_else(|| pstyle.text_primary.with_alpha(0.25))
+            .with_alpha(alpha);
+
+        // Pixel y for a given amplitude value.
+        let amp_to_y = |v: f32| -> f32 {
+            let t = (v - y_min) / y_span;
+            plot_y + (1.0 - t.clamp(0.0, 1.0)) * plot_h
+        };
+
+        // Grid + centerline. Grid lines split each half of the
+        // range into `grid_divisions + 1` slices, mirrored around
+        // the midpoint so the chart reads symmetrically regardless
+        // of whether the range is symmetric in absolute terms.
+        if show_grid && grid_divisions > 0 {
+            let mid = (y_min + y_max) * 0.5;
+            for i in 1..=grid_divisions {
+                let frac = i as f32 / (grid_divisions + 1) as f32;
+                for sign in [1.0_f32, -1.0_f32] {
+                    let amp = mid + sign * frac * (y_span * 0.5);
+                    let py = amp_to_y(amp);
+                    let mut path = blinc_core::draw::Path::new();
+                    path = path.move_to(plot_x, py).line_to(plot_x + plot_w, py);
+                    p.stroke_path(&path, &Stroke::new(1.0), Brush::Solid(grid));
+                }
+            }
+        }
+        if show_centerline {
+            let mid_y = amp_to_y((y_min + y_max) * 0.5);
+            let mut path = blinc_core::draw::Path::new();
+            path = path.move_to(plot_x, mid_y).line_to(plot_x + plot_w, mid_y);
+            p.stroke_path(&path, &Stroke::new(1.0), Brush::Solid(center));
+        }
+
+        // Wave plot.
+        if data.len() >= 2 && plot_w > 1.0 {
+            let n = data.len();
+            let x_step = plot_w / (n - 1).max(1) as f32;
+            let mut path = blinc_core::draw::Path::new();
+            for (i, sample) in data.iter().enumerate() {
+                let x = plot_x + (i as f32) * x_step;
+                let v = match style {
+                    WaveStyle::Mirrored => sample.abs(),
+                    _ => *sample,
+                };
+                let y = amp_to_y(v);
+                if i == 0 {
+                    path = path.move_to(x, y);
+                } else {
+                    path = path.line_to(x, y);
+                }
+            }
+
+            // Optional fill before stroke so the line lands on top.
+            match style {
+                WaveStyle::Filled => {
+                    // Close the path back to the centerline so the
+                    // fill area is bounded.
+                    let mid_y = amp_to_y((y_min + y_max) * 0.5);
+                    let last_x = plot_x + ((n - 1) as f32) * x_step;
+                    let mut fill_path = path.clone();
+                    fill_path = fill_path
+                        .line_to(last_x, mid_y)
+                        .line_to(plot_x, mid_y)
+                        .close();
+                    p.fill_path(&fill_path, Brush::Solid(fill));
+                }
+                WaveStyle::Mirrored => {
+                    // Mirror: emit the upper envelope path, then a
+                    // second path mirrored below the centerline,
+                    // and fill the combined band.
+                    let mid_y = amp_to_y((y_min + y_max) * 0.5);
+                    let mut mirror = blinc_core::draw::Path::new();
+                    // Walk forward at the upper envelope, then back
+                    // along the lower (mirrored) envelope.
+                    for (i, sample) in data.iter().enumerate() {
+                        let x = plot_x + (i as f32) * x_step;
+                        let y_up = amp_to_y(sample.abs());
+                        if i == 0 {
+                            mirror = mirror.move_to(x, y_up);
+                        } else {
+                            mirror = mirror.line_to(x, y_up);
+                        }
+                    }
+                    for (i, sample) in data.iter().enumerate().rev() {
+                        let x = plot_x + (i as f32) * x_step;
+                        let y_dn = mid_y + (mid_y - amp_to_y(sample.abs()));
+                        mirror = mirror.line_to(x, y_dn);
+                    }
+                    mirror = mirror.close();
+                    p.fill_path(&mirror, Brush::Solid(fill));
+                }
+                WaveStyle::Stroke => {}
+            }
+
+            // Stroke the primary path.
+            let mut s = Stroke::new(line_width);
+            s.cap = LineCap::Round;
+            s.join = LineJoin::Round;
+            p.stroke_path(&path, &s, Brush::Solid(stroke));
+
+            // Mirrored variant also strokes the lower envelope.
+            if matches!(style, WaveStyle::Mirrored) {
+                let mid_y = amp_to_y((y_min + y_max) * 0.5);
+                let mut lower = blinc_core::draw::Path::new();
+                for (i, sample) in data.iter().enumerate() {
+                    let x = plot_x + (i as f32) * x_step;
+                    let y_dn = mid_y + (mid_y - amp_to_y(sample.abs()));
+                    if i == 0 {
+                        lower = lower.move_to(x, y_dn);
+                    } else {
+                        lower = lower.line_to(x, y_dn);
+                    }
+                }
+                p.stroke_path(&lower, &s, Brush::Solid(stroke));
+            }
+        }
+
+        // Tooltip. Crosshair at cursor x, value pill above.
+        if tooltip && !disabled && data.len() >= 2 && plot_w > 1.0 {
+            if let Some(local) = resp.pointer_local {
+                let cursor_x = local.x;
+                let plot_local_x = (cursor_x - pad).clamp(0.0, plot_w);
+                let n = data.len();
+                let idx = ((plot_local_x / plot_w) * (n - 1) as f32)
+                    .round()
+                    .clamp(0.0, (n - 1) as f32) as usize;
+                let sample = data[idx];
+                let display = match style {
+                    WaveStyle::Mirrored => sample.abs(),
+                    _ => sample,
+                };
+                let x = plot_x + (idx as f32) * (plot_w / (n - 1) as f32);
+                let y = amp_to_y(display);
+
+                // Vertical crosshair from rect top to bottom of plot
+                let mut cross = blinc_core::draw::Path::new();
+                cross = cross.move_to(x, plot_y).line_to(x, plot_y + plot_h);
+                p.stroke_path(
+                    &cross,
+                    &Stroke::new(1.0),
+                    Brush::Solid(pstyle.text_primary.with_alpha(0.30)),
+                );
+
+                // Pill at the sample point
+                p.fill_circle(Point::new(x, y), 3.0, Brush::Solid(stroke));
+
+                let prec = tooltip_precision.unwrap_or_else(|| {
+                    let abs = display.abs();
+                    if abs < 1.0 {
+                        3
+                    } else if abs < 100.0 {
+                        2
+                    } else {
+                        1
+                    }
+                });
+                let mut text = format!("{:.*}", prec as usize, display);
+                if let Some(unit) = &tooltip_unit {
+                    text.push_str(unit);
+                }
+                let ts = text_style(&pstyle, pstyle.text_primary);
+                let txt_w = approx_text_width(&text, &pstyle);
+                let pad_pill = 6.0_f32;
+                let pill_w = txt_w + pad_pill * 2.0;
+                let pill_h = pstyle.line_height + 4.0;
+                let mut px = x - pill_w * 0.5;
+                if px < plot_x {
+                    px = plot_x;
+                }
+                if px + pill_w > plot_x + plot_w {
+                    px = plot_x + plot_w - pill_w;
+                }
+                let py = (y - pill_h - 6.0).max(plot_y);
+                let pill_rect = Rect::new(px, py, pill_w, pill_h);
+                p.fill_rect(
+                    pill_rect,
+                    CornerRadius::uniform(4.0),
+                    Brush::Solid(pstyle.field_bg.with_alpha(0.92)),
+                );
+                p.stroke_rect(
+                    pill_rect,
+                    CornerRadius::uniform(4.0),
+                    &Stroke::new(1.0),
+                    Brush::Solid(pstyle.field_border),
+                );
+                p.draw_text(&text, &ts, Point::new(px + pad_pill, py + pill_h * 0.5));
+            }
+        }
+
+        // PiP corner — inline paint mirroring the chart family.
+        let pointer_in_pip = if pip && !disabled {
+            if let Some(local) = resp.pointer_local {
+                let lx = p.rect().x() + local.x;
+                let ly = p.rect().y() + local.y;
+                let pad_pip = 4.0_f32;
+                let btn_size = 20.0_f32;
+                let bx = p.rect().x() + p.rect().width() - btn_size - pad_pip;
+                let by = p.rect().y() + pad_pip;
+                lx >= bx && lx < bx + btn_size && ly >= by && ly < by + btn_size
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if pip && !disabled {
+            let pad_pip = 4.0_f32;
+            let btn_size = 20.0_f32;
+            let bx = p.rect().x() + p.rect().width() - btn_size - pad_pip;
+            let by = p.rect().y() + pad_pip;
+            let btn_rect = Rect::new(bx, by, btn_size, btn_size);
+            let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
+                (
+                    pstyle.button_hover,
+                    pstyle.field_border_focus,
+                    pstyle.text_primary,
+                )
+            } else {
+                (
+                    pstyle.background,
+                    pstyle.field_border,
+                    pstyle.text_secondary,
+                )
+            };
+            p.fill_rect(btn_rect, CornerRadius::uniform(4.0), Brush::Solid(btn_bg));
+            p.stroke_rect(
+                btn_rect,
+                CornerRadius::uniform(4.0),
+                &Stroke::new(1.0),
+                Brush::Solid(btn_border),
+            );
+            // Glyph: 12 × 9 outlined frame + 5 × 4 inner fill.
+            const GW: f32 = 12.0;
+            const GH: f32 = 9.0;
+            let gx = bx + ((btn_size - GW) * 0.5).round();
+            let gy = by + ((btn_size - GH) * 0.5).round();
+            p.stroke_rect(
+                Rect::new(gx, gy, GW, GH),
+                CornerRadius::uniform(1.5),
+                &Stroke::new(1.5),
+                Brush::Solid(icon_color),
+            );
+            p.fill_rect(
+                Rect::new(gx + 6.0, gy + 5.0, 5.0, 4.0),
+                CornerRadius::uniform(1.0),
+                Brush::Solid(icon_color),
+            );
+            if resp.clicked && pointer_in_pip {
+                resp.clicked = false;
+                resp.pip_clicked = true;
+            }
+        }
+
+        resp
+    }
+}
+
+impl<'a> PortalUi<'a> {
+    /// Open an oscilloscope-style waveform plot of a signed `Vec<f32>`
+    /// signal. Bind to either `&mut Vec<f32>` or `&Signal<Vec<f32>>`.
+    /// Default y range is `(-1, 1)` and the renderer centres the
+    /// signal on the rect's vertical mid-line. Builder methods cover
+    /// style (`.stroke()` / `.filled()` / `.mirrored()`), y-range,
+    /// line width, grid + centerline visibility, colour overrides,
+    /// tooltip, and the PiP corner button.
+    pub fn wave_graph<'b, V: PortalValue<'b, Vec<f32>>>(
+        &'b mut self,
+        data: V,
+    ) -> WaveGraphBuilder<'a, 'b> {
+        WaveGraphBuilder {
+            ui: self,
+            value: data.into_binding(),
+            style: WaveStyle::Stroke,
+            width_override: None,
+            height_override: None,
+            y_range: None,
+            line_width: 1.5,
+            grid_divisions: 2,
+            show_centerline: true,
+            show_grid: true,
+            stroke_color: None,
+            fill_color: None,
+            grid_color: None,
+            centerline_color: None,
+            background: None,
+            disabled: false,
+            shadow_token: None,
+            tooltip: true,
+            tooltip_precision: None,
+            tooltip_unit: None,
+            pip: false,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// noise — procedural 2D pattern visualiser. Perlin / Worley /
+// Voronoi all flow through blinc_noise and reduce to a Vec<u8> RGBA
+// buffer uploaded via `draw_rgba_pixels`. Useful for game-tooling
+// shaders, audio noise floors, terrain previews.
 // ─────────────────────────────────────────────────────────────────────
 
 /// Choice of procedural noise function.

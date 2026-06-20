@@ -204,6 +204,42 @@ ui.radar_chart(&axes)
     .show();
 ```
 
+## wave_graph
+
+Oscilloscope-style signed-amplitude plot over `&Signal<Vec<f32>>`.
+Same data shape as `chart`, but centered on zero with optional
+horizontal grid divisions and a centerline. Square aspect by
+default. Use for audio waveforms, LFO traces, signed control
+signals.
+
+```rust
+let buffer = ctx.use_state(|| vec![0.0_f32; 256]);
+
+// Default: stroke style, ±1 range, grid + centerline visible.
+ui.wave_graph(&buffer).show();
+
+// Filled audio-editor style with tighter range + tooltip + PiP.
+ui.wave_graph(&buffer)
+    .filled()
+    .y_range(-1.0..1.0)
+    .grid_divisions(3)
+    .line_width(1.0)
+    .tooltip(true)
+    .pip(true)
+    .show();
+
+// Mirrored — abs(sample) reflected above + below the centerline.
+ui.wave_graph(&buffer).mirrored().show();
+```
+
+Builder methods: `.stroke()` / `.filled()` / `.mirrored()`
+(or `.style(WaveStyle::...)`), `.y_range(Range<f32>)`,
+`.line_width(f32)`, `.grid_divisions(u32)`,
+`.show_centerline(bool)`, `.show_grid(bool)`, `.stroke_color(c)` /
+`.fill_color(c)` / `.grid_color(c)` / `.centerline_color(c)`,
+`.background(c)`, `.tooltip(bool)`, `.tooltip_precision(u8)`,
+`.tooltip_unit("V")`, `.pip(bool)`, `.disabled(bool)`.
+
 ## noise
 
 Procedural pattern preview — Perlin fbm, Worley cells, or Voronoi

@@ -22,10 +22,10 @@ How to wire portal-UI into a host's canvas + overlay + event loop.
   (`ButtonBuilder`, `SliderBuilder`, `NumericInputBuilder`,
   `TextInputBuilder`, `SwitchBuilder`, `SelectBuilder`,
   `ColorPickerBuilder`, `ChartsBuilder`, `PieChartBuilder`,
-  `RadarChartBuilder`, `NoiseBuilder`, `TextureBuilder`,
-  `SdfShapeBuilder`) plus supporting enums (`ChartVariant`,
-  `ChartDecimation`, `NoiseVariant`, `TextureSource`,
-  `TextureFit`, `SdfShape`).
+  `RadarChartBuilder`, `WaveGraphBuilder`, `NoiseBuilder`,
+  `TextureBuilder`, `SdfShapeBuilder`) plus supporting enums
+  (`ChartVariant`, `ChartDecimation`, `WaveStyle`, `NoiseVariant`,
+  `TextureSource`, `TextureFit`, `SdfShape`).
 - **`color_wheel`** — `color_wheel_panel(value_signal)` returns a
   content closure suitable for `blinc_cn::popover` or any other
   host overlay. Anchored against a `color_picker` chip's
