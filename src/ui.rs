@@ -992,8 +992,7 @@ impl<'a> PortalUi<'a> {
         // skew the measurement — `rect.right()` is the same value
         // whether the cursor will advance on x or y next.
         let right_edge = rect.x() + rect.width();
-        self.final_max_x
-            .set(self.final_max_x.get().max(right_edge));
+        self.final_max_x.set(self.final_max_x.get().max(right_edge));
         // Advance the cursor for the next widget.
         match self.layout {
             LayoutDirection::Vertical => self.cursor.y += size.1 + self.style.spacing,
@@ -1365,7 +1364,6 @@ mod tests {
         let b = Portal::new("different_key").id();
         assert_ne!(a1, b, "different host keys → distinct portal ids");
     }
-
 
     #[test]
     fn portal_manager_retain_drops_missing_keys() {

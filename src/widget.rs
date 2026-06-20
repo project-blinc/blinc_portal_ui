@@ -524,7 +524,12 @@ impl<'a, 'b> SwitchBuilder<'a, 'b> {
             } else {
                 style.field_border
             };
-            p.stroke_rect(p.rect(), radius, &Stroke::new(1.0), Brush::Solid(border_color));
+            p.stroke_rect(
+                p.rect(),
+                radius,
+                &Stroke::new(1.0),
+                Brush::Solid(border_color),
+            );
         }
 
         let thumb_r = height * 0.5 - 2.0;
@@ -563,7 +568,11 @@ impl<'a, 'b> SwitchBuilder<'a, 'b> {
         } else {
             thumb_brush
         };
-        p.fill_circle(Point::new(thumb_cx, thumb_cy), thumb_r, Brush::Solid(thumb_brush));
+        p.fill_circle(
+            Point::new(thumb_cx, thumb_cy),
+            thumb_r,
+            Brush::Solid(thumb_brush),
+        );
 
         resp
     }
@@ -597,7 +606,9 @@ impl<'a> PortalUi<'a> {
 
     /// Deprecated: use `ui.switch(&sig).show()` — the unified
     /// builder accepts both `&mut bool` and `&Signal<bool>`.
-    #[deprecated(note = "Use `ui.switch(&sig).show()` instead — the builder accepts both &mut bool and &Signal<bool>.")]
+    #[deprecated(
+        note = "Use `ui.switch(&sig).show()` instead — the builder accepts both &mut bool and &Signal<bool>."
+    )]
     pub fn switch_signal(&mut self, sig: &Signal<bool>) -> Response {
         self.switch(sig).show()
     }
@@ -962,8 +973,7 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
         // Theme palette resolution.
         let stroke_brush_base = stroke_color.unwrap_or(style.accent);
         let fill_brush_base = fill_color.unwrap_or(style.accent.with_alpha(0.15));
-        let baseline_col_base =
-            baseline_color.unwrap_or(style.text_secondary.with_alpha(0.3));
+        let baseline_col_base = baseline_color.unwrap_or(style.text_secondary.with_alpha(0.3));
         let (stroke_brush, fill_brush, baseline_col) = if disabled {
             (
                 stroke_brush_base.with_alpha(0.4),
@@ -1103,7 +1113,11 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
             // popovers / lifted controls use, so the button
             // stands off the data.
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
-                (style.button_hover, style.field_border_focus, style.text_primary)
+                (
+                    style.button_hover,
+                    style.field_border_focus,
+                    style.text_primary,
+                )
             } else {
                 (style.background, style.field_border, style.text_secondary)
             };
@@ -1253,10 +1267,7 @@ impl<'a> PortalUi<'a> {
     /// Reads theme tokens for stroke / fill / baseline; explicit
     /// `.stroke_color(...)` etc. overrides exist for series that
     /// want a non-accent palette (e.g. warning / error tones).
-    pub fn chart<'b, V: PortalValue<'b, Vec<f32>>>(
-        &'b mut self,
-        data: V,
-    ) -> ChartsBuilder<'a, 'b> {
+    pub fn chart<'b, V: PortalValue<'b, Vec<f32>>>(&'b mut self, data: V) -> ChartsBuilder<'a, 'b> {
         ChartsBuilder {
             ui: self,
             value: data.into_binding(),
@@ -1547,8 +1558,7 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             if inner_r > 0.0 {
                 // Donut wedge — walk outer CW, inner CCW back.
                 let a = a0;
-                let inner_start =
-                    Point::new(cx + inner_r * a.cos(), cy + inner_r * a.sin());
+                let inner_start = Point::new(cx + inner_r * a.cos(), cy + inner_r * a.sin());
                 path = path.move_to(inner_start.x, inner_start.y);
                 // Outer arc (a0 → a1), step by step.
                 for k in 0..=steps {
@@ -1629,7 +1639,11 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
             let by = p.rect().y() + pad;
             let btn_rect = Rect::new(bx, by, btn_size, btn_size);
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
-                (style.button_hover, style.field_border_focus, style.text_primary)
+                (
+                    style.button_hover,
+                    style.field_border_focus,
+                    style.text_primary,
+                )
             } else {
                 (style.background, style.field_border, style.text_secondary)
             };
@@ -2028,16 +2042,12 @@ impl<'a, 'b> RadarChartBuilder<'a, 'b> {
         } else {
             style.accent.with_alpha(alpha * 0.18)
         };
-        let grid_col = grid_color
-            .unwrap_or_else(|| style.field_border.with_alpha(alpha * 0.7));
-        let axis_col = axis_color
-            .unwrap_or_else(|| style.text_secondary.with_alpha(alpha * 0.35));
+        let grid_col = grid_color.unwrap_or_else(|| style.field_border.with_alpha(alpha * 0.7));
+        let axis_col = axis_color.unwrap_or_else(|| style.text_secondary.with_alpha(alpha * 0.35));
 
         let two_pi = std::f32::consts::TAU;
         let start_offset = -std::f32::consts::FRAC_PI_2;
-        let axis_angle = |i: usize| -> f32 {
-            start_offset + (i as f32) * two_pi / (n as f32)
-        };
+        let axis_angle = |i: usize| -> f32 { start_offset + (i as f32) * two_pi / (n as f32) };
 
         // Grid rings — 4 concentric circles at 25/50/75/100 %.
         if show_grid {
@@ -2159,7 +2169,11 @@ impl<'a, 'b> RadarChartBuilder<'a, 'b> {
             let by = p.rect().y() + pad;
             let btn_rect = Rect::new(bx, by, btn_size, btn_size);
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
-                (style.button_hover, style.field_border_focus, style.text_primary)
+                (
+                    style.button_hover,
+                    style.field_border_focus,
+                    style.text_primary,
+                )
             } else {
                 (style.background, style.field_border, style.text_secondary)
             };
@@ -2209,9 +2223,7 @@ impl<'a, 'b> RadarChartBuilder<'a, 'b> {
                     for i in 0..n {
                         let ang = axis_angle(i);
                         // Smallest unsigned angular distance.
-                        let diff = ((cursor_ang - ang).sin().abs()).atan2(
-                            (cursor_ang - ang).cos(),
-                        );
+                        let diff = ((cursor_ang - ang).sin().abs()).atan2((cursor_ang - ang).cos());
                         let d = diff.abs();
                         if d < best_d {
                             best_d = d;
@@ -2529,7 +2541,11 @@ impl<'a, 'b> NoiseBuilder<'a, 'b> {
             let by = p.rect().y() + pad;
             let btn_rect = Rect::new(bx, by, btn_size, btn_size);
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
-                (style.button_hover, style.field_border_focus, style.text_primary)
+                (
+                    style.button_hover,
+                    style.field_border_focus,
+                    style.text_primary,
+                )
             } else {
                 (style.background, style.field_border, style.text_secondary)
             };
@@ -2929,7 +2945,11 @@ impl<'a, 'b, 'src> TextureBuilder<'a, 'b, 'src> {
             let by = p.rect().y() + pad;
             let btn_rect = Rect::new(bx, by, btn_size, btn_size);
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
-                (style.button_hover, style.field_border_focus, style.text_primary)
+                (
+                    style.button_hover,
+                    style.field_border_focus,
+                    style.text_primary,
+                )
             } else {
                 (style.background, style.field_border, style.text_secondary)
             };
@@ -3289,11 +3309,7 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             }
             SdfShape::Capsule2D => {
                 let r = inner.height() * 0.5;
-                p.fill_rect(
-                    inner,
-                    CornerRadius::uniform(r),
-                    Brush::Solid(fill_brush),
-                );
+                p.fill_rect(inner, CornerRadius::uniform(r), Brush::Solid(fill_brush));
                 if let Some(sc) = stroke {
                     p.stroke_rect(
                         inner,
@@ -3331,12 +3347,7 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
 
                 let ctx = &mut *p.ctx;
                 ctx.set_3d_transform(rotate_x, rotate_y, 1800.0);
-                ctx.set_3d_shape(
-                    shape.shape_type_3d(),
-                    depth * sq,
-                    ambient,
-                    specular,
-                );
+                ctx.set_3d_shape(shape.shape_type_3d(), depth * sq, ambient, specular);
                 ctx.set_3d_light(light_dir, light_intensity);
 
                 p.fill_rect(
@@ -3382,7 +3393,11 @@ impl<'a, 'b> SdfShapeBuilder<'a, 'b> {
             let by = p.rect().y() + pad;
             let btn_rect = Rect::new(bx, by, btn_size, btn_size);
             let (btn_bg, btn_border, icon_color) = if pointer_in_pip {
-                (style.button_hover, style.field_border_focus, style.text_primary)
+                (
+                    style.button_hover,
+                    style.field_border_focus,
+                    style.text_primary,
+                )
             } else {
                 (style.background, style.field_border, style.text_secondary)
             };
@@ -3643,7 +3658,9 @@ impl<'a> PortalUi<'a> {
         }
     }
 
-    #[deprecated(note = "Use `ui.slider(&sig, range).show()` instead — the builder accepts both &mut f32 and &Signal<f32>.")]
+    #[deprecated(
+        note = "Use `ui.slider(&sig, range).show()` instead — the builder accepts both &mut f32 and &Signal<f32>."
+    )]
     pub fn slider_signal(&mut self, sig: &Signal<f32>, range: std::ops::Range<f32>) -> Response {
         self.slider(sig, range).show()
     }
@@ -3818,11 +3835,8 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
             .filter(|u| !u.is_empty())
             .map(|u| text_width(u, &style) + 4.0)
             .unwrap_or(0.0);
-        let content_w = text_width(
-            &format_numeric(value.get(), precision, integer),
-            &style,
-        ) + unit_w
-            + 16.0;
+        let content_w =
+            text_width(&format_numeric(value.get(), precision, integer), &style) + unit_w + 16.0;
         let width = match width_override {
             Some(w) => w.max(three_char_w),
             None => content_w.max(three_char_w),
@@ -4036,16 +4050,11 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
                     if frac > 0.0 {
                         let chip = p.rect();
                         let fill_w = chip.width() * frac;
-                        let fill_rect = blinc_core::layer::Rect::new(
-                            chip.x(),
-                            chip.y(),
-                            fill_w,
-                            chip.height(),
-                        );
+                        let fill_rect =
+                            blinc_core::layer::Rect::new(chip.x(), chip.y(), fill_w, chip.height());
                         let r = style.control_radius;
                         let right_r = if frac >= 0.9999 { r } else { 0.0 };
-                        let radius =
-                            blinc_core::layer::CornerRadius::new(r, right_r, right_r, r);
+                        let radius = blinc_core::layer::CornerRadius::new(r, right_r, right_r, r);
                         let tint_alpha = if disabled { 0.06 } else { 0.18 };
                         let tint = style.accent.with_alpha(tint_alpha);
                         p.fill_rect(fill_rect, radius, Brush::Solid(tint));
@@ -4155,8 +4164,7 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
                     span / 200.0
                 };
                 const BASE_PIXELS_PER_STEP: f32 = 4.0;
-                let pixels_per_step =
-                    (BASE_PIXELS_PER_STEP / drag_sensitivity.max(0.01)).max(0.5);
+                let pixels_per_step = (BASE_PIXELS_PER_STEP / drag_sensitivity.max(0.01)).max(0.5);
                 let raw_steps = state.drag_accum_pixels / pixels_per_step;
                 let integer_steps = raw_steps.trunc();
                 if integer_steps.abs() >= 1.0 {
@@ -4181,9 +4189,7 @@ impl<'a, 'b> NumericInputBuilder<'a, 'b> {
             // edit = left-aligned) on accidental clicks.
             const DOUBLE_CLICK_WINDOW_S: f32 = 0.3;
             let now = ui.time();
-            if now - state.last_click_time < DOUBLE_CLICK_WINDOW_S
-                && state.last_click_time > 0.0
-            {
+            if now - state.last_click_time < DOUBLE_CLICK_WINDOW_S && state.last_click_time > 0.0 {
                 state.editing = true;
                 state.scratch = format_numeric(current, precision, integer);
                 state.caret = state.scratch.len();
@@ -4522,7 +4528,9 @@ impl<'a> PortalUi<'a> {
         }
     }
 
-    #[deprecated(note = "Use `ui.text_input(&sig).show()` instead — the builder accepts both &mut String and &Signal<String>.")]
+    #[deprecated(
+        note = "Use `ui.text_input(&sig).show()` instead — the builder accepts both &mut String and &Signal<String>."
+    )]
     pub fn text_input_signal(&mut self, sig: &Signal<String>) -> Response {
         self.text_input(sig).show()
     }

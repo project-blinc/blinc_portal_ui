@@ -69,11 +69,11 @@ pub fn color_wheel_panel(hex: Signal<String>) -> Div {
         .to_hsva();
     let hsva = signal((h0, s0, v0, a0));
     let drag_mode = signal(0u8); // 0=idle, 1=ring, 2=sv
-    // Bounds captured at mouse_down so on_drag has a stable origin
-    // even when `EventContext::local_x/y` semantics differ between
-    // the initial hit and subsequent drag dispatches. Mirrors the
-    // pattern in `cn::slider` which uses absolute `mouse_x` + a
-    // stored start.
+                                 // Bounds captured at mouse_down so on_drag has a stable origin
+                                 // even when `EventContext::local_x/y` semantics differ between
+                                 // the initial hit and subsequent drag dispatches. Mirrors the
+                                 // pattern in `cn::slider` which uses absolute `mouse_x` + a
+                                 // stored start.
     let drag_origin = signal((0.0_f32, 0.0_f32));
 
     // Snapshot constants for closures — atan2 axis convention is

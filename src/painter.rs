@@ -165,11 +165,7 @@ impl<'a> PortalPainter<'a> {
     /// stack semantics as `shadow_self` but the renderer projects
     /// the shadow INTO the rect — produces a recessed-surface look
     /// (sunken track, pressed-in field).
-    pub fn inner_shadow_self(
-        &mut self,
-        style: &PortalStyle,
-        stack: &[blinc_core::layer::Shadow],
-    ) {
+    pub fn inner_shadow_self(&mut self, style: &PortalStyle, stack: &[blinc_core::layer::Shadow]) {
         if stack.is_empty() {
             return;
         }

@@ -651,9 +651,13 @@ impl PortalStyle {
         // blinc_theme::Shadow into a blinc_core::layer::Shadow once
         // here so the painter doesn't re-convert per frame.
         let theme_shadows = blinc_theme::ThemeState::get().shadows();
-        let lower_stack = |stack: &[blinc_theme::tokens::Shadow]| -> Vec<blinc_core::layer::Shadow> {
-            stack.iter().map(|s| blinc_core::layer::Shadow::from(s.clone())).collect()
-        };
+        let lower_stack =
+            |stack: &[blinc_theme::tokens::Shadow]| -> Vec<blinc_core::layer::Shadow> {
+                stack
+                    .iter()
+                    .map(|s| blinc_core::layer::Shadow::from(s.clone()))
+                    .collect()
+            };
         let buttons_shadow = ButtonShadows {
             primary: lower_stack(theme_shadows.get(ShadowToken::Md)),
             secondary: lower_stack(theme_shadows.get(ShadowToken::Md)),

@@ -37,17 +37,17 @@ pub mod widget;
 pub use crate::color_wheel::color_wheel_panel;
 pub use crate::core::{
     ButtonPalette, ButtonPalettes, ButtonShadows, ButtonVariant, HostBridge, PortalId,
-    PortalStorage, PortalStyle, PortalValue, Response, Sense, ShadowMix, ShadowToken,
-    ValueBinding, WidgetId,
-};
-pub use crate::widget::{
-    ButtonBuilder, ChartDecimation, ChartVariant, ChartsBuilder, ColorPickerBuilder,
-    NoiseBuilder, NoiseVariant, NumericInputBuilder, PieChartBuilder, RadarChartBuilder,
-    SdfShape, SdfShapeBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder,
-    TextureBuilder, TextureFit, TextureSource,
+    PortalStorage, PortalStyle, PortalValue, Response, Sense, ShadowMix, ShadowToken, ValueBinding,
+    WidgetId,
 };
 pub use crate::painter::PortalPainter;
 pub use crate::signal::PortalSubscriptions;
 pub use crate::ui::{
     install_click_hook, FrameOutcome, LayoutDirection, Portal, PortalFrame, PortalManager, PortalUi,
+};
+pub use crate::widget::{
+    ButtonBuilder, ChartDecimation, ChartVariant, ChartsBuilder, ColorPickerBuilder, NoiseBuilder,
+    NoiseVariant, NumericInputBuilder, PieChartBuilder, RadarChartBuilder, SdfShape,
+    SdfShapeBuilder, SelectBuilder, SliderBuilder, SwitchBuilder, TextInputBuilder, TextureBuilder,
+    TextureFit, TextureSource,
 };
