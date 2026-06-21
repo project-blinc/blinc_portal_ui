@@ -62,6 +62,35 @@ fn text_style(style: &PortalStyle, color: Color) -> TextStyle {
     }
 }
 
+/// Draw a tooltip value-pill label vertically centred on its CAP box
+/// (cap-top → baseline) rather than the font em box.
+///
+/// Chart tooltips show digit-only values ("0.642", "23%") that carry no
+/// descenders. `TextBaseline::Middle` centres the full font em box, so
+/// the empty descender slug is allocated at the bottom of the pill and
+/// the number reads as top-heavy — visible "excess bottom padding".
+/// Anchoring on the cap box puts equal space above the caps and below
+/// the baseline regardless of the font's descender depth.
+///
+/// `cap ≈ 0.7em` is the standard figure height for the UI sans stack;
+/// exact per-font cap metrics aren't reachable from the widget layer,
+/// and the approximation is well within a pixel for the sizes in play.
+fn draw_pill_value(
+    p: &mut PortalPainter,
+    label: &str,
+    style: &PortalStyle,
+    color: Color,
+    x: f32,
+    pill_top: f32,
+    pill_h: f32,
+) {
+    let mut ts = text_style(style, color);
+    ts.baseline = TextBaseline::Alphabetic;
+    let cap = style.font_size * 0.7;
+    let baseline_y = pill_top + (pill_h + cap) * 0.5;
+    p.draw_text(label, &ts, Point::new(x, baseline_y));
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // label
 // ─────────────────────────────────────────────────────────────────────
@@ -993,12 +1022,14 @@ pub fn paint_chart(
                 &Stroke::new(1.0),
                 Brush::Solid(style.field_border),
             );
-            let mut ts = text_style(style, style.text_primary);
-            ts.baseline = TextBaseline::Middle;
-            p.draw_text(
+            draw_pill_value(
+                p,
                 &label_text,
-                &ts,
-                Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                style,
+                style.text_primary,
+                px_pill + pad_x,
+                py_pill,
+                pill_h,
             );
         }
     }
@@ -1198,12 +1229,14 @@ pub fn paint_pie(
                     &Stroke::new(1.0),
                     Brush::Solid(style.field_border),
                 );
-                let mut ts = text_style(style, style.text_primary);
-                ts.baseline = TextBaseline::Middle;
-                p.draw_text(
+                draw_pill_value(
+                    p,
                     &label,
-                    &ts,
-                    Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                    style,
+                    style.text_primary,
+                    px_pill + pad_x,
+                    py_pill,
+                    pill_h,
                 );
             }
         }
@@ -1450,12 +1483,14 @@ pub fn paint_radar(
                 &Stroke::new(1.0),
                 Brush::Solid(style.field_border),
             );
-            let mut ts = text_style(style, style.text_primary);
-            ts.baseline = TextBaseline::Middle;
-            p.draw_text(
+            draw_pill_value(
+                p,
                 &label_text,
-                &ts,
-                Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                style,
+                style.text_primary,
+                px_pill + pad_x,
+                py_pill,
+                pill_h,
             );
         }
     }
@@ -2043,12 +2078,14 @@ impl<'a, 'b> ChartsBuilder<'a, 'b> {
                         &Stroke::new(1.0),
                         Brush::Solid(style.field_border),
                     );
-                    let mut ts = text_style(&style, style.text_primary);
-                    ts.baseline = TextBaseline::Middle;
-                    p.draw_text(
+                    draw_pill_value(
+                        &mut p,
                         &label_text,
-                        &ts,
-                        Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                        &style,
+                        style.text_primary,
+                        px_pill + pad_x,
+                        py_pill,
+                        pill_h,
                     );
                 }
             }
@@ -2552,12 +2589,14 @@ impl<'a, 'b> PieChartBuilder<'a, 'b> {
                             &Stroke::new(1.0),
                             Brush::Solid(style.field_border),
                         );
-                        let mut ts = text_style(&style, style.text_primary);
-                        ts.baseline = TextBaseline::Middle;
-                        p.draw_text(
+                        draw_pill_value(
+                            &mut p,
                             &label,
-                            &ts,
-                            Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                            &style,
+                            style.text_primary,
+                            px_pill + pad_x,
+                            py_pill,
+                            pill_h,
                         );
                     }
                 }
@@ -3076,12 +3115,14 @@ impl<'a, 'b> RadarChartBuilder<'a, 'b> {
                         &Stroke::new(1.0),
                         Brush::Solid(style.field_border),
                     );
-                    let mut ts = text_style(&style, style.text_primary);
-                    ts.baseline = TextBaseline::Middle;
-                    p.draw_text(
+                    draw_pill_value(
+                        &mut p,
                         &label_text,
-                        &ts,
-                        Point::new(px_pill + pad_x, py_pill + pill_h * 0.5),
+                        &style,
+                        style.text_primary,
+                        px_pill + pad_x,
+                        py_pill,
+                        pill_h,
                     );
                 }
             }
@@ -3535,7 +3576,6 @@ impl<'a, 'b> WaveGraphBuilder<'a, 'b> {
                 if let Some(unit) = &tooltip_unit {
                     text.push_str(unit);
                 }
-                let ts = text_style(&pstyle, pstyle.text_primary);
                 let txt_w = approx_text_width(&text, &pstyle);
                 let pad_pill = 6.0_f32;
                 let pill_w = txt_w + pad_pill * 2.0;
@@ -3560,7 +3600,7 @@ impl<'a, 'b> WaveGraphBuilder<'a, 'b> {
                     &Stroke::new(1.0),
                     Brush::Solid(pstyle.field_border),
                 );
-                p.draw_text(&text, &ts, Point::new(px + pad_pill, py + pill_h * 0.5));
+                draw_pill_value(&mut p, &text, &pstyle, pstyle.text_primary, px + pad_pill, py, pill_h);
             }
         }
 
